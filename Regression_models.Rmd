@@ -1,0 +1,1681 @@
+---
+title: "ALS tear fluid project - 3 regression models"
+author: "Clara Meijs"
+date: "28-10-2022"
+output:
+  html_document:
+    df_print: paged
+    keep_md: yes
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 5
+    theme: lumen
+---
+
+This script will take you through the ALS tear fluid project. This project aims to create a diagnostic tool out of the proteomics landscape of tear fluid. The analyses consist of: fitting a model for the old and the new proteomics dataset (n=103 and n=209), and fitting a model on the western blot data. 
+
+## 0 Preparatory activities
+
+Start with clearing environment and loading packages
+
+```{r libraries, results='hide', message=FALSE,class.source = 'fold-hide'}
+rm(list=ls())
+
+library('ggplot2')
+library('tidyverse')
+library('Rtsne')
+library('umap')
+library('pheatmap')
+library('RColorBrewer')
+library("factoextra")
+library("viridis")
+library("dplyr")
+library('caret')
+library('ranger')
+library('glmnet')
+library('pROC')
+library('RobustRankAggreg')
+library('matrixStats') # row standard deviation
+library('ggthemr')
+ggthemr('greyscale', layout = "scientific")
+library('fgsea')
+library('org.Hs.eg.db')
+library('uwot')
+library('h2o')
+library('kernlab')
+library('scales')
+library('naniar')
+library('plyr')
+
+
+
+# define colours for plots
+farben = viridis(2, option="C", direction = -1, begin = 0.2, end = 0.8)
+```
+
+Setting directory to correct map and create directory for output:
+
+```{r set-working-directories,message=FALSE,class.source = 'fold-hide'}
+# if you are using Rstudio run the following command, otherwise, set the working directory to the folder where this script is in
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+
+# create directory for results
+dir.create(file.path(getwd(),'results'), showWarnings = FALSE)
+# create directory for plots
+dir.create(file.path(getwd(),'plots'), showWarnings = FALSE)
+```
+
+## 1 Old dataset 
+
+### 1.1 Data preprocessing 
+
+Load data, and have a look at it
+
+```{r load-data,message=FALSE}
+# LOAD DATA
+# data frame 1: row names = patientID, protein expression values (columns)
+# data frame 2: row names = patientID, patientinfo (columns), status column values: 1 and 0
+data_frame = read.csv('data/Old_proteomics_data_expression.csv', row.names = 1)
+df_patient_info = read.csv('data/Old_proteomics_data_patient_overview.csv', row.names = 1)
+
+data_frame[1:10,1:10] #because too many rows for head() function
+dim(data_frame)
+
+min(data_frame[,2:ncol(data_frame)]);max(data_frame[,2:ncol(data_frame)]) #minimum and maximum values of protein expression
+
+head(df_patient_info)
+dim(df_patient_info)
+
+# Kernel Density Plot
+d <- density(unlist(data_frame[,2:ncol(data_frame)]))
+log.d <- density(log(unlist(data_frame[,2:ncol(data_frame)])))
+plot(d, main="data distribution")
+plot(log.d, main="log-transformed data distribution")
+
+```
+
+Data is already pre-processed: all values between 0 and 1, log2-transformed, filtered for zero values (only proteins with valid values in at least 66% in each group (ALS/control) were kept), and imputation was performed using Perseus (default settings based on normal distribution).
+
+Therefore, the code normalization code below is not necessary:
+
+```{r normalization}
+# normalise expression values (optional)
+#data_frame = apply(data_frame, MARGIN = 2, FUN = function(X) (X - min(X))/diff(range(X)))
+```
+
+Entrez-IDs are added to the data:
+
+```{r entrez-id,results='hide', message=FALSE}
+#get names right background
+
+# first load the data and then put the gene names into a vector called background
+background = names(data_frame)
+# fix formatting error from loading csv into R
+for(element in background){
+  background[background == element] = gsub("\\.","-", element)
+}
+
+# check names found in entrez database
+library(org.Hs.eg.db)
+hs = org.Hs.eg.db
+ids = select(hs, 
+             keys = background,
+             columns = c("ENTREZID", "SYMBOL"),
+             keytype = "SYMBOL")
+
+ids[which(is.na(ids$ENTREZID)), "SYMBOL"] # names not found in entrez databank
+
+# prepare a vector with names to replace the ones that cannot be found
+replace = c("", "LACRT", "CALM1", "IGKV2D-24", "CD59","IGKV3D-11", "IGKV1-39", "", "IGLC2", "C4B", "TNFSF12", "SDCBP2", "YARS1", "AARS1", "NME2",
+            "ARF3", "SARS1", "TGM3", "",  "ARPC4", "CYRIB", "DARS1", "TJP2",  "HSPA1B",  "DDX19B", "ACTC1", "EIF3CL","IGHV2-70D", "EEF1A1",
+            "HARS1", "GFUS",  "GET3", "UPK3BL1", "KRT74", "H2BC12", "MYL12A", "", "DEFA1" , "RARS1", "UBE2D3", "RPL22","H2AB1",
+            "GSN", "SUMO3", "H3-3A", "WARS1", "PEDS1-UBE2V1")
+
+# replace the not found gene names
+if(length(ids[which(is.na(ids$ENTREZID)), "SYMBOL"]) == length(replace)){
+  i = 1
+  for(number in which(is.na(ids$ENTREZID))){
+    background[number] = replace[i]
+    i = i+1
+  }
+} else{
+  print("error, replace vector does not fit missing gene names")
+}
+
+# remove the gene names that are empty ( i.e. I did not figure out which proteins they are supposed to be/ their annotation suggest that they are not mappable)
+background = background[! background == ""]
+
+# rerun to get final set of EntrezIDs
+ids = select(hs, 
+             keys = background,
+             columns = c("ENTREZID", "SYMBOL"),
+             keytype = "SYMBOL")
+
+# double check no NAs are left
+ids[which(is.na(ids$ENTREZID)), "SYMBOL"]
+
+# safe entrezIDs of background
+background_ids = ids$ENTREZID
+```
+
+
+Status data from the patient information are combined with the protein expression data.
+
+```{r combine datasets}
+
+rownames(data_frame)=data_frame$X #put patient IDs in the rownames
+data_frame = data_frame[,2:ncol(data_frame)] #remove patid's from first column
+
+# data frame needs to contain the protein expression values and patient status
+df_ml = transform(merge(data_frame, df_patient_info['status'], by = 'row.names', all.x = T), row.names = Row.names, Row.names = NULL)
+
+df_ml[1:10,1:10]
+
+```
+
+### 1.2 Unsupervised analysis 
+
+Includes PCA, UMAP, tSNE and heatmap analysis and visualisations
+
+#### 1.2.1 PCA {#pca}
+
+Perform PCA and create three different plots: a scree plot, a variable plot, and a patient plot
+
+```{r PCA, results='hide',message=FALSE,fig.show='hide'}
+
+# set seed for reproducible results
+set.seed(9)
+
+summary(df_ml$status)
+
+# run pca function from base R
+pca_patients = prcomp(df_ml[ , !names(df_ml) == "status"], scale = T)
+
+#visualize PCA outcomes
+      
+    #scree plot
+
+       fviz_screeplot(pca_patients, ncp = 30) #scree plot
+       ggsave("plots/old_pca_scree.jpg", width = 11, height = 8, units = "in")
+       ggsave("plots/old_pca_scree.pdf", width = 11, height = 8, units = "in")
+      
+    #PCA variable plot
+      
+      fviz_pca_var(pca_patients,
+                   col.var = "coord", # Color by contributions to the PC
+                   gradient.cols = farben,
+                   repel = TRUE     # Avoid text overlapping
+                   )
+      ggsave("plots/old_pca_variables.jpg", width = 11, height = 8, units = "in")
+      ggsave("plots/old_pca_variables.pdf", width = 11, height = 8, units = "in")
+
+    # Patient plot
+
+      # extract values to calculate explained Variance of each PC
+      pca_summary = summary(pca_patients)$importance
+      varExp = round(pca_summary[2,]*100,2)
+      # extract values and create data frame for plot
+      pca = data.frame(pca_patients$x)
+      
+      # add status to data frame for plotting
+      if(all(rownames(pca) == rownames(df_ml))){
+        pca$group = df_ml$status
+      }
+      
+      # plot PCA with patients
+      ggplot(pca, aes(x=PC1,y=PC2, colour = as.factor(group))) + 
+        geom_point(size = 2) +
+        scale_color_manual(name = "Group", labels = c("ctrl", "ALS"), values = farben) +
+        xlab(paste("PC1 (",varExp[1],"%)")) + ylab(paste("PC2 (",varExp[2],"%)")) + ggtitle("PCA")
+      # save plot
+      ggsave("plots/old_pca_patients.jpg", width = 11, height = 8, units = "in")
+      ggsave("plots/old_pca_patients.pdf", width = 11, height = 8, units = "in")
+
+
+```
+
+
+Tada!
+
+![Scree plot](plots/old_pca_scree.jpg) ![Variables plot](plots/old_pca_variables.jpg) ![Patients plot](plots/old_pca_patients.jpg)
+
+#### 1.2.2 t-SNE {#t-sne}
+
+t-SNE (t-distributed stochastic neighbourhood embedding) is another form
+of PCA. t-SNE is also a unsupervised non-linear dimensionality reduction
+and data visualization technique. The math behind t-SNE is quite complex
+but the idea is simple. It embeds the points from a higher dimension to
+a lower dimension trying to preserve the neighborhood of that point.
+
+Unlike PCA it tries to preserve the Local structure of data by
+minimizing the Kullback--Leibler divergence (KL divergence) between the
+two distributions with respect to the locations of the points in the
+map. It is one of the best dimensionality reduction techniques, and
+handles outliers better than PCA.
+
+```{r t-SNE, results='hide',message=FALSE,fig.show='hide'}
+set.seed(9)
+
+# run tsne function from Rtsne package
+tsne_out = Rtsne(df_ml[ , !names(df_ml) == "status"])
+
+# extract values to data frame and add status for plotting
+tsne_plot = as.data.frame(tsne_out$Y)
+tsne_plot$group = df_ml$status
+
+# plot tSNE
+ggplot(tsne_plot) + geom_point(aes(x=V1, y=V2, color = as.factor(group))) + ggtitle("tSNE Patients") +
+  scale_color_manual(name = "Group", labels = c("ctrl", "ALS"), values = farben)
+# save plot
+ggsave("plots/old_tsne.jpg", width = 11, height = 8, units = "in")
+ggsave("plots/old_tsne.pdf", width = 11, height = 8, units = "in")
+```
+
+![tSNE plot](plots/old_tsne.jpg)
+
+#### 1.2.3 UMAP
+
+UMAP (Uniform Manifold Approximation and Projection) is another
+dimensionality reduction approach that can be used for visualisation
+similarly to t-SNE, but also for general non-linear dimension reduction.
+The algorithm is founded on three assumptions about the data
+
+-   The data is uniformly distributed on Riemannian manifold;
+
+-   The Riemannian metric is locally constant (or can be approximated as
+    such);
+
+-   The manifold is locally connected.
+
+```{r UMAP, results='hide',message=FALSE,fig.show='hide'}
+# set seed for reproducible results
+set.seed(9)
+
+# run umap function from umap package
+umap_out = umap::umap(df_ml[,!names(df_ml) == "status"])
+# extract values for plot
+umap_plot = as.data.frame(umap_out$layout)
+
+# add status to data frame for plotting
+if(all(rownames(umap_plot) == rownames(df_ml))){
+  umap_plot$group = df_ml$status
+}
+
+# plot umap
+ggplot(umap_plot) + geom_point(aes(x=V1, y=V2, color = as.factor(group))) +
+  ggtitle("umap Patients") +
+  scale_color_manual(name = "Group", labels = c("ctrl", "ALS"), values = farben)
+# save umap
+ggsave("plots/old_umap.jpg", width = 11, height = 8, units = "in")
+ggsave("plots/old_umap.pdf", width = 11, height = 8, units = "in")
+```
+
+![UMAP plot](plots/old_umap.jpg)
+
+UMAP function contains an option to perform PCA before performing the
+UMAP. Repeat UMAP analysis with first reducing the data to 50 PCs. This
+way, the UMAP becomes much more powerful. Especially considering the
+high dimensionality of the data in comparison with the number of
+participants. We need the UMAP function from the 'uwot' package for
+this.
+
+```{r PCA-plus-UMAP, results='hide',message=FALSE,fig.show='hide'}
+
+
+# set seed for reproducible results
+set.seed(9)
+
+# run umap function from umap package
+umap_out = uwot::umap(df_ml[,!names(df_ml) == "status"], pca = 50)
+# extract values for plot
+umap_plot = as.data.frame(umap_out)
+
+# add status to data frame for plotting
+if(all(rownames(umap_plot) == rownames(df_ml))){
+  umap_plot$group = df_ml$status
+}
+
+# plot umap
+ggplot(umap_plot) + geom_point(aes(x=V1, y=V2, color = as.factor(group))) +
+  ggtitle("umap + PCA Patients") +
+  scale_color_manual(name = "Group", labels = c("ctrl", "ALS"), values = farben)
+# save umap
+ggsave("plots/old_umap_PCA.jpg", width = 11, height = 8, units = "in")
+ggsave("plots/old_umap_PCA.pdf", width = 11, height = 8, units = "in")
+```
+
+![UMAP + PCA plot](plots/old_umap_PCA.jpg)
+
+#### 1.2.4 Auto-encoder {#auto-encoder}
+
+```{r auto-encoder, results='hide',message=FALSE,fig.show='hide'}
+
+h2o.no_progress()  # turn off progress bars
+h2o.init(max_mem_size = "5g")  # initialize H2O instance
+
+# Convert mnist features to an h2o input data set
+features <- as.h2o(df_ml[,!names(df_ml) == "status"])
+
+# Train an autoencoder
+ae1 <- h2o.deeplearning(
+  x = seq_along(features),
+  training_frame = features,
+  autoencoder = TRUE,
+  hidden = 2,
+  activation = 'Tanh',
+  sparse = TRUE
+)
+
+# Extract the deep features
+ae1_codings <- h2o.deepfeatures(ae1, features, layer = 1)
+
+# extract values for plot
+ae1_plot = as.data.frame(ae1_codings)
+
+# add status to data frame for plotting
+#if(all(rownames(ae1_plot) == rownames(df_ml))){
+#  ae1_plot$group = df_ml$status
+#}
+
+ae1_plot$group = df_ml$status 
+
+# plot umap
+ggplot(ae1_plot) + geom_point(aes(x=DF.L1.C1, y=DF.L1.C2, color = as.factor(group))) +
+  ggtitle("Auto-encoder Patients") +
+  scale_color_manual(name = "Group", labels = c("ctrl", "ALS"), values = farben)
+# save umap
+ggsave("plots/old_autoencoder.jpg", width = 11, height = 8, units = "in")
+ggsave("plots/old_autoencoder.pdf", width = 11, height = 8, units = "in")
+
+```
+![Auto-encoder](plots/old_autoencoder.jpg)
+
+
+#### 1.2.5 Compare dimensionality reduction techniques {#compare-dimensionality-reduction-techniques}
+
+We have now tried five different approaches for dimensionality
+reduction, from the more classical approaches (PCA), more advanced approaches (tSNE, UMAP), a combination of
+more sophisticated and classical approaches (PCA + UMAP) towards the
+newer techniques that use deep learning (auto-encoders). The results can
+be seen below:
+
+Now, we can compare the five approaches here: 
+![PCA plot](plots/old_pca_patients.jpg) 
+![tSNE plot](plots/old_tsne.jpg) 
+![UMAPplot](plots/old_umap.jpg) 
+![UMAP + PCA plot](plots/old_umap_PCA.jpg)
+![Auto-encoder](plots/old_autoencoder.jpg)
+
+### 1.3 Heatmap
+
+To get an idea of how the protein expressions are distributed, we
+construct a heatmap
+
+```{r heatmap, results='hide',fig.show='hide'}
+
+## heatmap ---------
+# change values of patient info to display control/ALS instead of binary values
+df_patient_info[which(df_patient_info$status == 0), "status"] = "control"
+df_patient_info[which(df_patient_info$status == 1), "status"] = "ALS"
+
+# get annotations ready
+annotation = data.frame(group = as.factor(df_patient_info$status), sex = as.factor(df_patient_info$sex), age = as.numeric(df_patient_info$age))
+rownames(annotation) = rownames(df_patient_info)
+annotation_colours <- list(group = c(control = "#000000", ALS = "#B2182B"), sex = c(w="lightpink1",m="skyblue1"), age =c("white", "darkgreen"))
+
+
+# save and plot heatmap
+p = pheatmap::pheatmap(as.matrix(t(df_ml[,1:ncol(df_ml)])), name = "expression",cutree_cols = 2,
+         show_colnames = T,
+         show_rownames = FALSE,
+         fontsize = 6,
+         annotation_col = annotation,
+         annotation_colors = annotation_colours,
+         color = viridis::viridis(100, option="C", direction = -1,),
+         main = "Heatmap")
+
+save_pheatmap_pdf <- function(x, filename, width=7, height=7) {
+   stopifnot(!missing(x))
+   stopifnot(!missing(filename))
+   pdf(filename, width=width, height=height)
+   grid::grid.newpage()
+   grid::grid.draw(x$gtable)
+   dev.off()
+}
+save_pheatmap_pdf(p, "plots/old_heatmap.pdf")
+
+save_pheatmap_jpg <- function(x, filename, width=900, height=600) {
+   stopifnot(!missing(x))
+   stopifnot(!missing(filename))
+   jpeg(filename, width=width, height=height)
+   grid::grid.newpage()
+   grid::grid.draw(x$gtable)
+   dev.off()
+}
+save_pheatmap_jpg(p, "plots/old_heatmap.jpg")
+
+```
+
+![Heatmap](plots/old_heatmap.jpg)
+
+### 1.5 In-house developed functions
+
+Jenny developed several functions to perform all upcoming analyses. In entails following functions: 
+
+- runML()
+
+- calculateROC()
+
+- plotWeights()
+
+- gsea()
+
+- auccurve()
+
+#### 1.5.1 runML()
+
+All 3 machine learning algorithms can be run with the runML() function from the [functions](/functions.R) script. Usage of the function and analysis including plotting of results and extracting feature weight/importance where possible, can be found in the [ml_github.R](/ml_github.R) script.
+The functions takes the following arguments
+
+* data_frame: data as data frame with a status column,
+
+* algorithm: 'lm', 'rf', 'svm lin' or 'svm rad',
+
+* cv: cross validation folds (default = 10),
+
+* BS_number: number of bootstrap runs (default = 1)
+
+
+ and returns a list of models, importance, predictions (probability), predictions (raw), indices (which samples had been used for training)
+ 
+```{r runML function, results='hide',class.source = 'fold-hide'}
+###       boot strap function       ###
+# runs machine learning on data with selected algorithm ( 'lm' (linear regression) or
+#                                                         'rf' (random forest) or
+#                                                         'svm lin' Support Vector Machine + linear kernel)
+#                                                         'svm rad' Support Vector Machine + radial kernel))
+# number of folds for cross validation (default = 10) and boot strap loops (default = 1)
+#
+# returns list objects with models, importance, predictions (raw and probability) and indices (samples used for training)
+
+
+runML = function(data_frame,algorithm, cv = 10, BS_number = 1){
+  #check input
+  stopifnot('Last argument (BS_number) is not a number.' = is.numeric(BS_number),
+            'Number given for cross validation is not a number ,' = is.numeric(cv),
+            'Data is not a dataframe.' = is.data.frame(data_frame),
+            'status column of df not correct' = all(df_ml$status == 1 | df_ml$status == 0),
+            'unknown algorithm. please select \'lm\',\'rf\',\'svm rad\' or \'svm lin\' ' = algorithm %in% c('lm','rf','svm rad','svm lin'))
+  
+  key_output = c('linear regressio (lasso)','random forest', 'Support Vector Machine (radial kernel)', 'Support Vector Machine (linear kernel)')
+  names(key_output) = c('lm','rf','svm rad','svm lin')
+  # Output parameters for user check
+  print(paste0('Running a ',BS_number,'x boot strap with a ',cv,' fold cross validation. Algorithm is ', key_output[[algorithm]]))
+  
+  data_frame$status = as.factor(make.names(data_frame$status)) # caret needs prediction variable to have name; turns 0 -> X0 and 1 -> X1
+  
+  # create lists to save results from bs
+  models = list()
+  importance = list()
+  predictions = list()
+  indices = list()
+  predictions_raw = list()
+  smp_size = floor(0.8 * nrow(data_frame)) # use 80% of data for training, 20% for testing
+  
+  #set the right parameters for each algo
+  if(algorithm == 'lm'| algorithm == 'svm rad' | algorithm == 'svm lin'){
+    ctrl = trainControl(method="cv",   
+                        number = cv,        
+                        summaryFunction=twoClassSummary,   # Use AUC to pick the best model
+                        classProbs=TRUE,savePredictions = TRUE)
+  }
+  else if(algorithm == 'rf'){
+    
+    n_features = ncol(data_frame[ ,!names(data_frame) == 'status'])
+    ctrl = trainControl(method = "cv", 
+                        number = cv, 
+                        search = 'grid',classProbs = TRUE, savePredictions = TRUE, summaryFunction=twoClassSummary )
+  }
+  
+  # run machine learning
+  for(i in 1:BS_number){
+  
+    train_ind = sample(seq_len(nrow(data_frame)), size = smp_size)
+    train = data_frame[train_ind, ]
+    test = data_frame[ -train_ind,!names(data_frame) == "status"]
+    
+    if (algorithm == 'lm'){
+      model = train(x=train[ , !names(train) == "status"],
+                    y= train$status,
+                    method = "glmnet", family = "binomial", tuneLength = 5, metric = "ROC",
+                    trControl = ctrl,
+                    tuneGrid=expand.grid(
+                      .alpha=1, # alpha 1 == lasso
+                      .lambda=seq(0, 100, by = 0.1))
+      )
+    }
+    
+    else if (algorithm == 'rf'){
+      tunegrid = expand.grid(
+        .mtry = c(2, 3, 4, 7, 11, 17, 27, floor(sqrt(n_features)), 41, 64, 99, 154, 237, 367, 567, 876),
+        .splitrule = c("extratrees","gini"),
+        .min.node.size = c(1,2,3,4,5)
+      )
+      
+      model = train(x=train[ , !names(train) == "status"],
+                    y= train$status,
+                    tuneGrid = tunegrid, 
+                    method = "ranger",  tuneLength = 15, metric = "ROC",
+                    num.trees = 500,
+                    trControl = ctrl,
+                    importance = 'impurity'
+      )
+    }
+    
+    else if (algorithm == 'svm lin'){
+      model = train(x=train[ , !names(train) == "status"],
+                    y= train$status,
+                    method = "svmLinear", tuneLength = 5, metric = "ROC",
+                    trControl = ctrl,
+      )
+    }
+    
+    else if (algorithm == 'svm rad'){
+      model = train(x=train[ , !names(train) == "status"],
+                    y= train$status,
+                    method = "svmRadial", tuneLength = 5, metric = "ROC",
+                    trControl = ctrl,
+      )
+    }
+    
+    models[[i]] = model
+    importance[[i]] = varImp(model)
+    predictions[[i]] = predict(model, newdata = test,type = "prob")
+    predictions_raw[[i]] = predict(model, newdata = test,type = "raw")
+    indices[[i]] = train_ind
+    print(paste0('finshed loop #',i)) # keep track of what is happening
+  }
+  return_list = list(models,importance,predictions,predictions_raw,indices)
+  names(return_list) = c('models','importance','predictions','predictions_raw','indices')
+  return(return_list)
+}
+```
+
+#### 1.5.2 calculateROC()
+
+
+```{r calculateROC function, results='hide',class.source = 'fold-hide'}
+###       calculate averaged ROC curve        ###
+# plots and returns data frame for averaged ROC curve from data and result from runML (indices, predictions (raw and probable))
+
+calculateROC = function(list_from_ML, data_frame, plot_path = FALSE){
+  # check input
+  stopifnot('Data is not a dataframe.' = is.data.frame(data_frame),
+            'First argument is not a list (result of runML).' = inherits(list_from_ML, 'list') & all(names(list_from_ML) == c('models','importance','predictions','predictions_raw','indices')),
+            'Please give a valid directory to save the file' = ifelse(plot_path == FALSE, TRUE, dir.exists(paste(strsplit(plot_path, split = '/')[[1]][-length(strsplit(plot_path, split = '/')[[1]])], collapse = '/'))))
+  
+  # extract needed lists from ML data
+  indices = list_from_ML[['indices']]
+  predictions = list_from_ML[['predictions']]
+  predictions_raw = list_from_ML[['predictions_raw']]
+  
+  # create one data frame to compare predicted vs actual status
+  predictions_compare = data.frame()
+  for(i in 1:length(indices)){
+    adding = data.frame(Class = data_frame$status[-indices[[i]]], predicted = predictions[[i]]$X0, resample = paste0("run ", i), auc = glmnet:::auc(data_frame$status[-indices[[i]]], predictions_raw[[i]]))
+    predictions_compare = rbind(predictions_compare,adding)
+  }
+  
+  # calculate ROC for each run
+  rocc = data.frame()
+  auc = c()
+  for(run in unique(predictions_compare$resample)){
+    onefold = dplyr::filter(predictions_compare, resample == run)
+    auc = c(auc,onefold$auc[1])
+    roc_run = roc(onefold$Class, onefold$predicted, direction = ">")
+    rocc = rbind(rocc, data.frame(Sp = roc_run$specificities, Sn = roc_run$sensitivities, n = rep(1:length(roc_run$sensitivities))))
+  }
+  
+  # aggregate the results and create new data frame
+  Sp = aggregate(Sp ~ n, rocc, mean)$Sp
+  Sn = aggregate(Sn ~ n, rocc, mean)$Sn
+  errorSp = aggregate(Sp ~ n, rocc, sd)$Sp
+  errorSn = aggregate(Sn ~ n, rocc, sd)$Sn
+  plotci = data.frame(Sp,Sn,errorSp,errorSn)
+  
+  # plot if path is given
+  if(plot_path != FALSE){
+    pdf(plot_path,paper="a4r", width = 11, height = 8)
+    print(ggplot(plotci, aes(x=(1-Sp),y=Sn)) + geom_line(aes(color = "darkorange")) + theme_bw() +
+      ggtitle("mean ROC curve and 95 % CI") +
+      geom_ribbon(aes(ymin = (Sn - 0.95*errorSn), ymax = (Sn + 0.95*errorSn), xmin = (1-Sp - 0.95*errorSp), xmax = (1-Sp + 0.95*errorSp),
+                      fill = "#B2B2B2"), alpha = 0.5) +
+      #   scale_y_continuous(expand = c(0,0), limits = c(0,1.02)) + scale_x_continuous(expand = c(0,0), limits = c(-0.01,1)) +
+      scale_color_manual(name = NULL, label = "mean", values = c("darkorange")) +
+      scale_fill_manual(name = NULL, label = "95 % CI", values = c('#B2B2B2') ) +
+      annotate("text", x = 0.2, y = 0.8, label = paste("mean AUC: ", round(mean(auc),2), "\u00B1 ", round(sd(auc),2)) ) +
+      geom_abline(slope = 1, color="darkgrey", alpha = 0.3))
+    dev.off()
+  }
+  
+  return(plotci)
+  
+}
+```
+
+```{r calculateROC function + jpeg, results='hide',class.source = 'fold-hide'}
+###       calculate averaged ROC curve        ###
+# plots and returns data frame for averaged ROC curve from data and result from runML (indices, predictions (raw and probable))
+
+calculateROC_jpeg = function(list_from_ML, data_frame, plot_path_pdf = FALSE, plot_path_jpeg){
+  
+  # extract needed lists from ML data
+  indices = list_from_ML[['indices']]
+  predictions = list_from_ML[['predictions']]
+  predictions_raw = list_from_ML[['predictions_raw']]
+  
+  # create one data frame to compare predicted vs actual status
+  predictions_compare = data.frame()
+  for(i in 1:length(indices)){
+    adding = data.frame(Class = data_frame$status[-indices[[i]]], predicted = predictions[[i]]$X0, resample = paste0("run ", i), auc = glmnet:::auc(data_frame$status[-indices[[i]]], predictions_raw[[i]]))
+    predictions_compare = rbind(predictions_compare,adding)
+  }
+  
+  # calculate ROC for each run
+  rocc = data.frame()
+  auc = c()
+  for(run in unique(predictions_compare$resample)){
+    onefold = dplyr::filter(predictions_compare, resample == run)
+    auc = c(auc,onefold$auc[1])
+    roc_run = roc(onefold$Class, onefold$predicted, direction = ">")
+    rocc = rbind(rocc, data.frame(Sp = roc_run$specificities, Sn = roc_run$sensitivities, n = rep(1:length(roc_run$sensitivities))))
+  }
+  
+  # aggregate the results and create new data frame
+  Sp = aggregate(Sp ~ n, rocc, mean)$Sp
+  Sn = aggregate(Sn ~ n, rocc, mean)$Sn
+  errorSp = aggregate(Sp ~ n, rocc, sd)$Sp
+  errorSn = aggregate(Sn ~ n, rocc, sd)$Sn
+  plotci = data.frame(Sp,Sn,errorSp,errorSn)
+  
+  # plot if path is given
+  if(plot_path_pdf != FALSE & plot_path_jpeg != FALSE){
+    
+    #pdf
+    pdf(plot_path_pdf,paper="a4r", width = 11, height = 8)
+    print(ggplot(plotci, aes(x=(1-Sp),y=Sn)) + geom_line(aes(color = "darkorange")) + theme_bw() +
+      ggtitle("mean ROC curve and 95 % CI") +
+      geom_ribbon(aes(ymin = (Sn - 0.95*errorSn), ymax = (Sn + 0.95*errorSn), xmin = (1-Sp - 0.95*errorSp), xmax = (1-Sp + 0.95*errorSp),
+                      fill = "#B2B2B2"), alpha = 0.5) +
+      #   scale_y_continuous(expand = c(0,0), limits = c(0,1.02)) + scale_x_continuous(expand = c(0,0), limits = c(-0.01,1)) +
+      scale_color_manual(name = NULL, label = "mean", values = c("darkorange")) +
+      scale_fill_manual(name = NULL, label = "95 % CI", values = c('#B2B2B2') ) +
+      annotate("text", x = 0.2, y = 0.8, label = paste("mean AUC: ", round(mean(auc),2), "\u00B1 ", round(sd(auc),2)) ) +
+      geom_abline(slope = 1, color="darkgrey", alpha = 0.3))
+    dev.off()
+    
+    #jpeg
+    jpeg(plot_path_jpeg, width = 900, height = 600)
+    print(ggplot(plotci, aes(x=(1-Sp),y=Sn)) + geom_line(aes(color = "darkorange")) + theme_bw() +
+      ggtitle("mean ROC curve and 95 % CI") +
+      geom_ribbon(aes(ymin = (Sn - 0.95*errorSn), ymax = (Sn + 0.95*errorSn), xmin = (1-Sp - 0.95*errorSp), xmax = (1-Sp + 0.95*errorSp),
+                      fill = "#B2B2B2"), alpha = 0.5) +
+      #   scale_y_continuous(expand = c(0,0), limits = c(0,1.02)) + scale_x_continuous(expand = c(0,0), limits = c(-0.01,1)) +
+      scale_color_manual(name = NULL, label = "mean", values = c("darkorange")) +
+      scale_fill_manual(name = NULL, label = "95 % CI", values = c('#B2B2B2') ) +
+      annotate("text", x = 0.2, y = 0.8, label = paste("mean AUC: ", round(mean(auc),2), "\u00B1 ", round(sd(auc),2)) ) +
+      geom_abline(slope = 1, color="darkgrey", alpha = 0.3))
+    dev.off()
+  }
+  
+  return(plotci)
+  
+}
+```
+#### 1.5.3 plotWeights()
+
+```{r plotWeights function, results='hide',class.source = 'fold-hide'}
+###       Extract weights/importance and plot their average       ###
+# plots top n (default = 50) proteins by averaged weight/importance
+# returns plot (if path is given) and data frame
+
+plotWeights = function(list_from_ML, plot_path = FALSE, number = 50){
+  #check input
+  stopifnot('First argument is not result from ML with algorithm linear regression, random forest or SVM (linear kernel)' = list_from_ML[['models']][[1]]$method %in% c('glmnet','ranger','svmLinear'),
+            'Please give a valid directory to save the file' = ifelse(plot_path == FALSE, TRUE, dir.exists(paste(strsplit(plot_path, split = '/')[[1]][-length(strsplit(plot_path, split = '/')[[1]])], collapse = '/'))))
+  
+  # extract models to continue based on which algorithm input is from
+  models = list_from_ML[['models']]
+  
+  ## linear regression ##
+  if(models[[1]]$method == 'glmnet'){ 
+    importance = list_from_ML[['importance']]
+    
+    # extract weights from all models
+    coefficient = list()
+    for(i in 1:length(models)){
+      coefficient[[i]] = coef.glmnet(models[[i]]$finalModel, models[[i]]$bestTune$lambda)
+    }
+    
+    #sort the weights
+    weights_lm = vector("list",0)
+    for (i in 1:length(coefficient)) {
+      for (j in 1:length(coefficient[[i]])) {
+        if(j == 1 || coefficient[[i]][j,1] == 0){ # skip intercept
+          next
+        }
+        else if (row.names(coefficient[[i]])[j] %in% names(weights_lm)) { # protein already has a list -> append vector with value
+          weights_lm[[row.names(coefficient[[i]])[j]]] = c(weights_lm[[row.names(coefficient[[i]])[j]]],coefficient[[i]][j,1])
+        }
+        else if (! row.names(coefficient[[i]])[j] %in% names(weights_lm)) {
+          weights_lm[[row.names(coefficient[[i]])[j]]] = c(coefficient[[i]][j])
+        }
+        else{
+          print("Failed to extract weights from linear regression model")
+          break
+        }
+      }
+    }
+    
+    # calculate statistics and put into data frame
+    avg = c()
+    error = c()
+    picks = c()
+    for (i in 1:length(weights_lm)) {
+      avg = c(avg,mean(weights_lm[[i]]))
+      error = c(error, sd(weights_lm[[i]]))
+      picks = c(picks,length(weights_lm[[i]]))
+    }
+    
+    weight = data.frame(avg,error, picks,row.names=names(weights_lm))
+    weight = weight[which(abs(weight$avg)>abs(weight$error) & weight$picks > 1), ]
+    
+    weight = weight[order(abs(weight$avg), decreasing = TRUE), ]
+    name = 'weight'
+  }
+  
+  ## random forest ##
+  else if(models[[1]]$method == 'ranger'){ 
+    rf_imp = list_from_ML[['importance']]
+    
+    # create data frame with names for all proteins
+    weight = data.frame(row.names = row.names(rf_imp[[1]]$importance))
+    
+    # fill data frame
+    for(i in 1:length(rf_imp)){
+      weight = cbind(weight, rf_imp[[i]]$importance, by = "row.names")
+      weight$by = NULL
+      names(weight)[names(weight) == "Overall"] = paste("run",i, sep = "")
+    }
+    
+    # calculate statistics into data frame
+    weight$avg = rowMeans(weight)
+    weight$error = rowSds(as.matrix(weight[,-(ncol(weight))]))
+    
+    weight = weight[order(weight$avg, decreasing = TRUE), ]
+    name = 'importance'
+  }
+  
+  ## svm linear kernel ##
+  else if(models[[1]]$method == 'svmLinear'){ 
+    # calculate weights for each run
+    for(i in 1:length(models)){
+      coef = models[[i]]$finalModel@coef[[1]]
+      matr = models[[i]]$finalModel@xmatrix[[1]]
+      
+      weig = as.data.frame(coef %*% matr)
+      
+      if(i == 1){
+        weight = weig
+      }
+      else if(i>1 & all(names(weig) == names(weight))){
+        weight = rbind(weight,weig)
+      }
+      else{
+        print(paste(i," ERROR: failed to extract protein weights from SVM linear; differing protein names between runs "))
+      }
+    }
+    
+    # calculate statistics and add to data frame
+    weight= as.data.frame(weight)
+    weight$avg = rowMeans(weight)
+    weight$error = rowSds(as.matrix(weight[,-ncol(weight)]))
+    
+    weight = weight[order(abs(weight$avg), decreasing = TRUE), ]
+    name = 'weight'
+  }
+  
+  # plot if path is given
+  if(plot_path != FALSE){
+    pdf(plot_path,paper="a4r", width = 11, height = 8)
+    print(ggplot(weight[1:number, ], aes(x = reorder(rownames(weight[1:number, ]),avg), y = avg, fill = avg > 0)) +
+      geom_bar(stat = "identity")+
+      geom_errorbar( aes(x=reorder(rownames(weight[1:number, ]),avg), ymin=avg-error, ymax=avg+error, colour="#287D8EFF"), width=0.2, alpha=0.9, size=1.2) +
+      xlab("Gene names") +
+      ylab(name) +
+      ggtitle(paste("Mean ",name," and standard deviation; ",models[[1]]$method)) +
+      theme_classic() +
+      theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+      scale_x_discrete(labels = abbreviate) + 
+      scale_fill_manual(name = NULL, label = NULL, values = c("darkorange", "darkgrey")) +
+      scale_color_manual(name = NULL, label = "standard deviation", values = c("darkblue")) +
+      guides(fill = 'none', colour = 'none'))
+    dev.off()
+  }
+  return(weight)
+}
+```
+
+```{r plotWeights function + jpeg, results='hide',class.source = 'fold-hide'}
+###       Extract weights/importance and plot their average       ###
+# plots top n (default = 50) proteins by averaged weight/importance
+# returns plot (if path is given) and data frame
+
+plotWeights_jpeg = function(list_from_ML, plot_path_pdf = FALSE, plot_path_jpeg = FALSE, number = 50){
+  # extract models to continue based on which algorithm input is from
+  models = list_from_ML[['models']]
+  
+  ## linear regression ##
+  if(models[[1]]$method == 'glmnet'){ 
+    importance = list_from_ML[['importance']]
+    
+    # extract weights from all models
+    coefficient = list()
+    for(i in 1:length(models)){
+      coefficient[[i]] = coef.glmnet(models[[i]]$finalModel, models[[i]]$bestTune$lambda)
+    }
+    
+    #sort the weights
+    weights_lm = vector("list",0)
+    for (i in 1:length(coefficient)) {
+      for (j in 1:length(coefficient[[i]])) {
+        if(j == 1 || coefficient[[i]][j,1] == 0){ # skip intercept
+          next
+        }
+        else if (row.names(coefficient[[i]])[j] %in% names(weights_lm)) { # protein already has a list -> append vector with value
+          weights_lm[[row.names(coefficient[[i]])[j]]] = c(weights_lm[[row.names(coefficient[[i]])[j]]],coefficient[[i]][j,1])
+        }
+        else if (! row.names(coefficient[[i]])[j] %in% names(weights_lm)) {
+          weights_lm[[row.names(coefficient[[i]])[j]]] = c(coefficient[[i]][j])
+        }
+        else{
+          print("Failed to extract weights from linear regression model")
+          break
+        }
+      }
+    }
+    
+    # calculate statistics and put into data frame
+    avg = c()
+    error = c()
+    picks = c()
+    for (i in 1:length(weights_lm)) {
+      avg = c(avg,mean(weights_lm[[i]]))
+      error = c(error, sd(weights_lm[[i]]))
+      picks = c(picks,length(weights_lm[[i]]))
+    }
+    
+    weight = data.frame(avg,error, picks,row.names=names(weights_lm))
+    weight = weight[which(abs(weight$avg)>abs(weight$error) & weight$picks > 1), ]
+    
+    weight = weight[order(abs(weight$avg), decreasing = TRUE), ]
+    name = 'weight'
+  }
+  
+  ## random forest ##
+  else if(models[[1]]$method == 'ranger'){ 
+    rf_imp = list_from_ML[['importance']]
+    
+    # create data frame with names for all proteins
+    weight = data.frame(row.names = row.names(rf_imp[[1]]$importance))
+    
+    # fill data frame
+    for(i in 1:length(rf_imp)){
+      weight = cbind(weight, rf_imp[[i]]$importance, by = "row.names")
+      weight$by = NULL
+      names(weight)[names(weight) == "Overall"] = paste("run",i, sep = "")
+    }
+    
+    # calculate statistics into data frame
+    weight$avg = rowMeans(weight)
+    weight$error = rowSds(as.matrix(weight[,-(ncol(weight))]))
+    
+    weight = weight[order(weight$avg, decreasing = TRUE), ]
+    name = 'importance'
+  }
+  
+  ## svm linear kernel ##
+  else if(models[[1]]$method == 'svmLinear'){ 
+    # calculate weights for each run
+    for(i in 1:length(models)){
+      coef = models[[i]]$finalModel@coef[[1]]
+      matr = models[[i]]$finalModel@xmatrix[[1]]
+      
+      weig = as.data.frame(coef %*% matr)
+      
+      if(i == 1){
+        weight = weig
+      }
+      else if(i>1 & all(names(weig) == names(weight))){
+        weight = rbind(weight,weig)
+      }
+      else{
+        print(paste(i," ERROR: failed to extract protein weights from SVM linear; differing protein names between runs "))
+      }
+    }
+    
+    # calculate statistics and add to data frame
+    weight= as.data.frame(weight)
+    weight$avg = rowMeans(weight)
+    weight$error = rowSds(as.matrix(weight[,-ncol(weight)]))
+    
+    weight = weight[order(abs(weight$avg), decreasing = TRUE), ]
+    name = 'weight'
+  }
+  
+  # plot if path is given
+  if(plot_path_pdf != FALSE & plot_path_jpeg != FALSE){
+    
+    #pdf 
+    pdf(plot_path_pdf,paper="a4r", width = 11, height = 8)
+    print(ggplot(weight[1:number, ], aes(x = reorder(rownames(weight[1:number, ]),avg), y = avg, fill = avg > 0)) +
+      geom_bar(stat = "identity")+
+      geom_errorbar( aes(x=reorder(rownames(weight[1:number, ]),avg), ymin=avg-error, ymax=avg+error, colour="#287D8EFF"), width=0.2, alpha=0.9, size=1.2) +
+      xlab("Gene names") +
+      ylab(name) +
+      ggtitle(paste("Mean ",name," and standard deviation; ",models[[1]]$method)) +
+      theme_classic() +
+      theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+      scale_x_discrete(labels = abbreviate) + 
+      scale_fill_manual(name = NULL, label = NULL, values = c("darkorange", "darkgrey")) +
+      scale_color_manual(name = NULL, label = "standard deviation", values = c("darkblue")) +
+      guides(fill = 'none', colour = 'none'))
+    dev.off()
+    
+    #jpeg
+    jpeg(plot_path_jpeg, width = 900, height = 600)
+    print(ggplot(weight[1:number, ], aes(x = reorder(rownames(weight[1:number, ]),avg), y = avg, fill = avg > 0)) +
+      geom_bar(stat = "identity")+
+      geom_errorbar( aes(x=reorder(rownames(weight[1:number, ]),avg), ymin=avg-error, ymax=avg+error, colour="#287D8EFF"), width=0.2, alpha=0.9, size=1.2) +
+      xlab("Gene names") +
+      ylab(name) +
+      ggtitle(paste("Mean ",name," and standard deviation; ",models[[1]]$method)) +
+      theme_classic() +
+      theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
+      scale_x_discrete(labels = abbreviate) + 
+      scale_fill_manual(name = NULL, label = NULL, values = c("darkorange", "darkgrey")) +
+      scale_color_manual(name = NULL, label = "standard deviation", values = c("darkblue")) +
+      guides(fill = 'none', colour = 'none'))
+    dev.off()
+  }
+  return(weight)
+}
+```
+#### 1.5.4 gsea()
+
+```{r gsea function, results='hide',class.source = 'fold-hide'}
+###       Run Gene Set Enrichment analysis on given background and vector of genes       ###
+# plots top n (default = 20) enriched KEGG pathways
+# returns plot (if path is given) and data frame
+
+gsea = function(genes, min_size = 3,plot_path = FALSE, number = 20, entrezID = FALSE, background){
+  stopifnot('minSize has to be a number' = is.numeric(min_size),
+            'background has to be a vector of type character' = is.vector(background, mode = 'character'),
+            'Please give a valid directory to save the file' = ifelse(plot_path == FALSE, TRUE, dir.exists(paste(strsplit(plot_path, split = '/')[[1]][-length(strsplit(plot_path, split = '/')[[1]])], collapse = '/'))),
+            'genes has to be a named vector with numeric value' = is.vector(genes, mode = 'numeric') & !any(is.na(names(genes))) | missing(background) )
+  
+  ## load pathways
+  kegg_pathways = gmtPathways("data/c2.cp.kegg.v7.5.1.entrez.gmt")
+  
+  ## get entrezID of background and filter pathways
+  # set mapping direction
+  keyt = ifelse(entrezID == FALSE, 'SYMBOL', 'ENTREZID')
+  
+  if(!missing(background)){
+    ids_b = AnnotationDbi::select(org.Hs.eg.db, 
+                   keys = background,
+                   columns = c("ENTREZID", "SYMBOL"),
+                   keytype = keyt)
+    background_id = ids_b$ENTREZID
+    # let user now if certain proteins were excluded due to not mapped EntrezID
+    if(any(is.na(background_id))){
+      background_id = background_id[!is.na(background_id)]
+      print(paste0('Could not find EntrezID for ', ids_b$SYMBOL[which(is.na(ids_b$ENTREZID))]),'. These will be ignored in further analysis.')
+    }
+    
+    # filter KEGG pathways
+    for(i in c(1:length(kegg_pathways))){
+      kegg_pathways[[i]] = kegg_pathways[[i]][which(kegg_pathways[[i]] %in% background_id)]
+    }
+  }
+  
+  ## get entrezID of genes
+  ids_g = AnnotationDbi::select(org.Hs.eg.db, 
+                 keys = names(genes),
+                 columns = c("ENTREZID", "SYMBOL"),
+                 keytype = keyt)
+  
+  gene_id = ids_g$ENTREZID
+  names(genes) = gene_id
+  
+  # let user now if certain proteins were excluded due to not mapped EntrezID
+  if(any(is.na(ids_g$ENTREZID))){
+    genes = genes[!is.na(names(genes))]
+    print(paste0('Could not find EntrezID for', ids_g$SYMBOL[which(is.na(ids_g$ENTREZID))],'. These will be ignored in further analysis.' ))
+  }
+  
+  ## run fgsea()
+  # set scoreType depending on data 
+  scoret = ifelse(all(genes >= 0), 'pos','std')
+  
+  fgsea_results = fgsea(pathways = kegg_pathways,
+                        stats    = genes,
+                        minSize  = min_size,
+                        maxSize  = 500,
+                        scoreType = scoret)
+  
+  # calculate number of genes in pathways 
+  fgsea_results$count = sapply(fgsea_results$leadingEdge,length)
+  # with small gene sample count is sometimes 0 -> filter
+  fgsea_results = fgsea_results[fgsea_results$count != 0, ]
+  
+  # store gene names, not just IDs in column
+  if(!missing(background)){
+    fgsea_results$geneNames =   sapply(fgsea_results$leadingEdge, function(x) paste0(ids_g$SYMBOL[which(ids_g$ENTREZID %in% x)], collapse = ', '))
+  }
+  
+  # get the actual length of the pathways as column
+  length_pathways = as.data.frame(lapply(kegg_pathways,length))
+  length_pathways = as.data.frame(t(length_pathways))
+  names(length_pathways) = 'pathwaySize'
+  length_pathways$pathway = row.names(length_pathways)
+  
+  # merge into one df 
+  fgsea_results = merge(fgsea_results,length_pathways, by = "pathway")
+  
+  # plot if path is given
+  if(plot_path != FALSE){
+    pdf(plot_path,paper="a4r", width = 11, height = 8)
+    print(ggplot(fgsea_results[order(fgsea_results$padj), ][1:number, ], aes(x = -log10(padj), y = reorder(pathway, -padj), fill = padj)) +
+      geom_bar(stat = "identity") +
+      xlab("- log(p-value)") +
+      ylab("Functional category") +
+      ggtitle("KEGG terms") +
+      labs(fill = "FDR value") +
+      scale_fill_viridis(option = "E")+ 
+      geom_text(aes(label = paste0(count, "/", pathwaySize)), hjust=-0.15, size =3.5)+ 
+      xlim(0, max(-log10(fgsea_results$padj))+0.02))
+    dev.off()
+  }
+  
+  return(fgsea_results)
+}
+```
+
+```{r gsea_jpeg function, results='hide',class.source = 'fold-hide'}
+###       Run Gene Set Enrichment analysis on given background and vector of genes       ###
+# plots top n (default = 20) enriched KEGG pathways
+# returns plot (if path is given) and data frame
+
+gsea_jpeg = function(genes, min_size = 3,plot_path_pdf = FALSE, plot_path_jpeg = FALSE, number = 20, entrezID = FALSE, background){
+  stopifnot('minSize has to be a number' = is.numeric(min_size),
+            'background has to be a vector of type character' = is.vector(background, mode = 'character'),
+            'genes has to be a named vector with numeric value' = is.vector(genes, mode = 'numeric') & !any(is.na(names(genes))) | missing(background) )
+  
+  ## load pathways
+  kegg_pathways = gmtPathways("data/c2.cp.kegg.v7.5.1.entrez.gmt")
+  
+  ## get entrezID of background and filter pathways
+  # set mapping direction
+  keyt = ifelse(entrezID == FALSE, 'SYMBOL', 'ENTREZID')
+  
+  if(!missing(background)){
+    ids_b = AnnotationDbi::select(org.Hs.eg.db, 
+                   keys = background,
+                   columns = c("ENTREZID", "SYMBOL"),
+                   keytype = keyt)
+    background_id = ids_b$ENTREZID
+    # let user now if certain proteins were excluded due to not mapped EntrezID
+    if(any(is.na(background_id))){
+      background_id = background_id[!is.na(background_id)]
+      print(paste0('Could not find EntrezID for ', ids_b$SYMBOL[which(is.na(ids_b$ENTREZID))]),'. These will be ignored in further analysis.')
+    }
+    
+    # filter KEGG pathways
+    for(i in c(1:length(kegg_pathways))){
+      kegg_pathways[[i]] = kegg_pathways[[i]][which(kegg_pathways[[i]] %in% background_id)]
+    }
+  }
+  
+  ## get entrezID of genes
+  ids_g = AnnotationDbi::select(org.Hs.eg.db, 
+                 keys = names(genes),
+                 columns = c("ENTREZID", "SYMBOL"),
+                 keytype = keyt)
+  
+  gene_id = ids_g$ENTREZID
+  names(genes) = gene_id
+  
+  # let user now if certain proteins were excluded due to not mapped EntrezID
+  if(any(is.na(ids_g$ENTREZID))){
+    genes = genes[!is.na(names(genes))]
+    print(paste0('Could not find EntrezID for', ids_g$SYMBOL[which(is.na(ids_g$ENTREZID))],'. These will be ignored in further analysis.' ))
+  }
+  
+  ## run fgsea()
+  # set scoreType depending on data 
+  scoret = ifelse(all(genes >= 0), 'pos','std')
+  
+  fgsea_results = fgsea(pathways = kegg_pathways,
+                        stats    = genes,
+                        minSize  = min_size,
+                        maxSize  = 500,
+                        scoreType = scoret)
+  
+  # calculate number of genes in pathways 
+  fgsea_results$count = sapply(fgsea_results$leadingEdge,length)
+  # with small gene sample count is sometimes 0 -> filter
+  fgsea_results = fgsea_results[fgsea_results$count != 0, ]
+  
+  # store gene names, not just IDs in column
+  if(!missing(background)){
+    fgsea_results$geneNames =   sapply(fgsea_results$leadingEdge, function(x) paste0(ids_g$SYMBOL[which(ids_g$ENTREZID %in% x)], collapse = ', '))
+  }
+  
+  # get the actual length of the pathways as column
+  length_pathways = as.data.frame(lapply(kegg_pathways,length))
+  length_pathways = as.data.frame(t(length_pathways))
+  names(length_pathways) = 'pathwaySize'
+  length_pathways$pathway = row.names(length_pathways)
+  
+  # merge into one df 
+  fgsea_results = merge(fgsea_results,length_pathways, by = "pathway")
+  
+  # plot if path is given
+  if(plot_path_pdf != FALSE & plot_path_jpeg != FALSE){
+    
+    #pdf
+    pdf(plot_path_pdf,paper="a4r", width = 11, height = 8)
+    print(ggplot(fgsea_results[order(fgsea_results$padj), ][1:number, ], aes(x = -log10(padj), y = reorder(pathway, -padj), fill = padj)) +
+      geom_bar(stat = "identity") +
+      xlab("- log(p-value)") +
+      ylab("Functional category") +
+      ggtitle("KEGG terms") +
+      labs(fill = "FDR value") +
+      scale_fill_viridis(option = "E")+ 
+      geom_text(aes(label = paste0(count, "/", pathwaySize)), hjust=-0.15, size =3.5)+ 
+      xlim(0, max(-log10(fgsea_results$padj))+0.02))
+    dev.off()
+    
+    #jpeg
+    jpeg(plot_path_jpeg,width = 11, height = 8)
+    print(ggplot(fgsea_results[order(fgsea_results$padj), ][1:number, ], aes(x = -log10(padj), y = reorder(pathway, -padj), fill = padj)) +
+      geom_bar(stat = "identity") +
+      xlab("- log(p-value)") +
+      ylab("Functional category") +
+      ggtitle("KEGG terms") +
+      labs(fill = "FDR value") +
+      scale_fill_viridis(option = "E")+ 
+      geom_text(aes(label = paste0(count, "/", pathwaySize)), hjust=-0.15, size =3.5)+ 
+      xlim(0, max(-log10(fgsea_results$padj))+0.02))
+    dev.off()
+    
+  }
+  
+  return(fgsea_results)
+}
+```
+
+#### 1.5.5 auccurve()
+
+```{r auccurve function, results='hide',class.source = 'fold-hide'}
+### AUC curve of linear model from previously calculated weights
+# calculates AUC of a linear model on a data set (protein_data) based on a given protein combination with average weights from previous linear model boot strapping
+# returns data frame for plotting combinations to auc
+auccurve = function(vectornames,weight_data,protein_data, maxn, add = F){
+  stopifnot(
+    'gene names in vector not represented in data frame' = vectornames %in% row.names(weight_data),
+    'vectornames is not a character vector' = is.vector(vectornames, mode = 'character')
+  )
+  
+  # if no maxn is given all possible combinations will be built
+  if(missing(maxn)){
+      maxn = length(vectornames)
+    }
+    
+    # prepare combinations of defined length
+    if(add == F){
+    res = Map(combn, list(vectornames), seq_along(c(1:maxn)), simplyfy = F)
+    test = unlist(res, recursive = FALSE)
+    vectors = list()
+    z=1
+    for(i in 1:(length(res))){
+      for(j in 1:(length(res[[i]])/length(res[[i]][ ,1]) ) ){
+        vectors[[z]] = res[[i]][,j]
+        z = z + 1
+      }
+    }
+    }
+  # if add is set to TRUE, combinations are only adding one protein after the other in order they are given (going from legnth 1 to length of vectornames)
+  else{
+    vectors = list()
+    z=1
+    for(i in 1:(length(vectornames))){
+      
+      vectors[[i]] = vectornames[1:i]
+      z = z + 1
+    }
+  }
+  
+  ## put combinations into empty dataframe
+  savespace = data.frame(combinations = I(vectors))
+  savespace$auc = NA
+  
+  ## add auc for the combinations
+  for(i in 1:nrow(savespace)){
+    interim = as.data.frame(weight_data)
+    # set all weights that are not in the combination of interes to 0
+    interim[! row.names(interim) %in% vectors[[i]], "V1"] = 0
+    # predict 0 or 1 by using the linear regression formula (y = w1*x1+ .... w_n*x_n)
+    interim_pred = as.matrix(as.matrix(protein_data[ ,!names(protein_data)=='status']) %*% as.matrix(interim))
+    # use glmnet function to calculate the auc between actual status and the calculated status, i.e. prediction
+    savespace$auc[i] = glmnet:::auc(interim_pred,protein_data$status)
+  }
+
+  savespace$combinations = lapply(savespace$combinations, function(X) paste0(X,collapse = ", "))
+  return(savespace)
+}
+```
+
+### 1.6 Supervised machine learning
+
+For upcoming analysis, we will set the number of bootstrapping to 'bs'
+
+```{r set number of bootstrapping}
+bs=2
+```
+
+#### 1.6.1 Linear Regression
+
+##### 1.6.1.1 Only proteomics data
+
+Linear regression is run using AUC to pick the best model, using glmnet algorithm, binomial distribution, and lasso.
+
+
+```{r run linear regression,results='hide',cache=TRUE}
+# arguments:  data_frame: data as data frame with a status column,
+#             algorithm: 'lm','rf','svm lin' or 'svm rad',
+#             cv: cross validation folds (default = 10),
+#             BS_number: number of bootstrap runs (default = 1)  
+# returns: list of models, importance, predictions (probability), predictions (raw), indices (which samples had been used for training)
+lm = runML(df_ml,'lm', BS_number = bs)
+```
+
+
+```{r save and plot results linear regression,results='hide',cache=TRUE}
+# save results for later use
+saveRDS(lm, file = 'results/old_linearModel.rds')
+
+# plot averaged ROC curve
+# takes result object from runML(), the original data frame and path to save plot (optional)
+# returns data frame with values for plot
+ROC_curve = calculateROC_jpeg(lm,df_ml,'plots/old_rocc_lm.pdf','plots/old_rocc_lm.jpeg')
+
+#Error in concordance.formula(y ~ prob) : 
+#  left hand side of the formula must be a numeric vector,
+# survival object, or an orderable factor
+
+# TRY TO MAKE NEW DATAFRAME WITH SEX AND AGE
+
+# save results for later use
+write.csv(ROC_curve, file = 'results/old_rocc_lm.csv')
+
+
+# extract weights + plot averaged
+# arguments:  list_from_ML: results from runML()
+#             plot_path:    path to save plot(optional)
+#             number:       number of proteins on plot
+# returns data frame with values for plot
+lm_weights = plotWeights_jpeg(lm,"plots/old_weights_lm.pdf","plots/old_weights_lm.jpeg")
+# save results for later use
+write.csv(lm_weights, file = 'results/old_weights_lm.csv')
+```
+
+The results of the linear regression:
+
+![Linear regression weights](plots/old_weights_lm.jpeg)
+![Linear regression ROC](plots/old_rocc_lm.jpeg)
+
+
+##### 1.6.1.2 Adding age and sex
+
+First, we have to add age and sex as values between 0 an 1
+
+```{r add age and sex to dataframe}
+
+# data frame needs to contain the protein expression values and patient status
+#df_ml_clin = transform(merge(data_frame, df_patient_info[c('age','sex','status')], by = 'row.names', all.x = T), row.names = Row.names, Row.names = NULL)
+
+df_ml_clin = transform(merge(df_ml, df_patient_info[c('age','sex')], by = 'row.names', all.x = T), row.names = Row.names, Row.names = NULL)
+
+df_ml_clin$sex = (as.numeric(as.factor(df_ml_clin$sex))-1)
+#df_ml_clin$sex = as.factor(df_ml_clin$sex)
+df_ml_clin$age = as.numeric(df_ml_clin$age)
+#df_ml_clin$status = as.integer(as.factor(df_ml_clin$status))
+#df_ml_clin$status[df_ml_clin$status == 2] = 0
+
+```
+
+
+```{r run linear regression with age and sex,results='hide',cache=TRUE,eval=F}
+# arguments:  data_frame: data as data frame with a status column,
+#             algorithm: 'lm','rf','svm lin' or 'svm rad',
+#             cv: cross validation folds (default = 10),
+#             BS_number: number of bootstrap runs (default = 1)  
+# returns: list of models, importance, predictions (probability), predictions (raw), indices (which samples had been used for training)
+lm_clin = runML(df_ml_clin,'lm', BS_number = bs)
+```
+
+
+```{r save and plot results linear regression with age and sex,results='hide',cache=TRUE,eval=F}
+# save results for later use
+saveRDS(lm_clin, file = 'results/old_linearModel_clin.rds')
+
+# plot averaged ROC curve
+# takes result object from runML(), the original data frame and path to save plot (optional)
+# returns data frame with values for plot
+ROC_curve_clin = calculateROC_jpeg(lm_clin,df_ml_clin,'plots/old_rocc_lm_clin.pdf','plots/old_rocc_lm_clin.jpeg')
+
+# save results for later use
+write.csv(ROC_curve_clin, file = 'results/old_rocc_lm_clin.csv')
+
+# extract weights + plot averaged
+# arguments:  list_from_ML: results from runML()
+#             plot_path:    path to save plot(optional)
+#             number:       number of proteins on plot
+# returns data frame with values for plot
+lm_weights_clin = plotWeights_jpeg(lm_clin,"plots/old_weights_lm_clin.pdf","plots/old_weights_lm_clin.jpeg")
+# save results for later use
+write.csv(lm_weights_clin, file = 'results/old_weights_lm_clin.csv')
+```
+
+The results of the linear regression:
+
+![Linear regression weights](plots/old_weights_lm_clin.jpeg)
+![Linear regression ROC](plots/old_rocc_lm_clin.jpeg)
+
+
+#### 1.6.2 Random Forest
+
+##### 1.6.2.1 Only using proteomics data
+
+```{r random forest proteomics data, results='hide',cache=TRUE,eval=F}
+# arguments:  data_frame: data as data frame with a status column,
+#             algorithm: 'lm','rf','svm lin' or 'svm rad',
+#             cv: cross validation folds (default = 10),
+#             BS_number: number of bootstrap runs (default = 1)
+# returns: list of models, importance, predictions (probability), predictions (raw), indices (which samples had been used for training)
+old_rf = runML(df_ml,'rf',BS_number = bs)
+
+# save results for later use
+saveRDS(old_rf, file = 'results/old_randomForest.rds')
+
+# plot averaged ROC curve
+# takes result object from runML(), the original data frame and path to save plot (optional)
+# returns data frame with values for plot
+old_ROC_curve_rf = calculateROC_jpeg(old_rf,df_ml,'plots/old_rocc_rf.pdf','plots/old_rocc_rf.jpeg')
+
+# save results for later use
+write.csv(old_ROC_curve_rf, file = 'results/old_rocc_rf.csv')
+
+# extract weights + plot averaged
+# arguments:  list_from_ML: results from runML()
+#             plot_path:    path to save plot(optional)
+#             number:       number of proteins on plot
+# returns data frame with values for plot
+old_rf_importance = plotWeights_jpeg(old_rf,'plots/old_importance_rf.pdf','plots/old_importance_rf.jpeg')
+# save results for later use
+write.csv(old_rf_importance, file = 'results/old_importance_rf.csv')
+```
+![Random forest weights](plots/old_importance_rf.jpeg)
+![Random forest ROC](plots/old_rocc_rf.jpeg)
+
+##### 1.6.2.1 Including age and sex
+
+```{r random forest proteomics data plus age and sex, results='hide',cache=TRUE,eval=F}
+# arguments:  data_frame: data as data frame with a status column,
+#             algorithm: 'lm','rf','svm lin' or 'svm rad',
+#             cv: cross validation folds (default = 10),
+#             BS_number: number of bootstrap runs (default = 1)
+# returns: list of models, importance, predictions (probability), predictions (raw), indices (which samples had been used for training)
+old_rf_clin = runML(df_ml_clin,'rf',BS_number = bs)
+
+# save results for later use
+saveRDS(old_rf_clin, file = 'results/old_randomForest_clin.rds')
+
+# plot averaged ROC curve
+# takes result object from runML(), the original data frame and path to save plot (optional)
+# returns data frame with values for plot
+old_ROC_curve_rf_clin = calculateROC_jpeg(old_rf_clin,df_ml_clin,'plots/old_rocc_rf_clin.pdf','plots/old_rocc_rf_clin.jpeg')
+
+# save results for later use
+write.csv(old_ROC_curve_rf_clin, file = 'results/old_rocc_rf_clin.csv')
+
+# extract weights + plot averaged
+# arguments:  list_from_ML: results from runML()
+#             plot_path:    path to save plot(optional)
+#             number:       number of proteins on plot
+# returns data frame with values for plot
+old_rf_importance_clin = plotWeights_jpeg(old_rf_clin,'plots/old_importance_rf_clin.pdf','plots/old_importance_rf_clin.jpeg')
+# save results for later use
+write.csv(old_rf_importance_clin, file = 'results/old_importance_rf_clin.csv')
+```
+![Random forest weights](plots/old_importance_rf_clin.jpeg)
+![Random forest ROC](plots/old_rocc_rf_clin.jpeg)
+
+
+#### 1.6.3 Support Vector Machine
+
+##### 1.6.3.1 Only proteomics data
+
+```{r support vector machine, results='hide',cache=TRUE,eval=F}
+# arguments:  data_frame: data as data frame with a status column,
+#             algorithm: 'lm','rf','svm lin' or 'svm rad',
+#             cv: cross validation folds (default = 10),
+#             BS_number: number of bootstrap runs (default = 1)  
+# returns: list of models, importance, predictions (probability), predictions (raw), indices (which samples had been used for training)
+old_svm_l = runML(df_ml,'svm lin', BS_number = bs)
+old_svm_r = runML(df_ml,'svm rad', BS_number = bs)
+# save results for alter use
+saveRDS(old_svm_l, file = 'results/old_svm_lin.rds')
+saveRDS(old_svm_r, file = 'results/old_svm_rad.rds')
+
+# plot averaged ROC curve
+# takes result object from runML(), the original data frame and path to save plot (optional)
+# returns data frame with values for plot
+old_ROC_curve_l = calculateROC_jpeg(old_svm_l,df_ml,'plots/old_rocc_svml.pdf','plots/old_rocc_svml.jpeg')
+old_ROC_curve_r = calculateROC_jpeg(old_svm_r,df_ml,'plots/old_rocc_svmr.pdf','plots/old_rocc_svmr.jpeg')
+
+# save results for alter use
+write.csv(old_ROC_curve_l, file = 'results/old_rocc_svml.csv')
+write.csv(old_ROC_curve_r, file = 'results/old_rocc_svmr.csv')
+
+# extract weights + plot averaged
+# arguments:  list_from_ML: results from runML()
+#             plot_path:    path to save plot(optional)
+#             number:       number of proteins on plot
+# returns data frame with values for plot
+old_svml_weights = plotWeights_jpeg(old_svm_l,"plots/old_weights_svml.pdf","plots/old_weights_svml.jpeg")
+# save results for later use
+write.csv(old_svml_weights, file = 'results/old_weights_svml.csv')
+```
+
+![SVM weights linear kernel](plots/old_weights_svml.jpeg)
+![ROC plot SVM linear kernel](plots/old_rocc_svml.jpeg)
+![ROC plot SVM radial kernel](plots/old_rocc_svmr.jpeg)
+
+##### 1.6.3.2 Also including age and sex
+
+```{r support vector machine plus age and sex, results='hide',cache=TRUE,eval=F}
+# arguments:  data_frame: data as data frame with a status column,
+#             algorithm: 'lm','rf','svm lin' or 'svm rad',
+#             cv: cross validation folds (default = 10),
+#             BS_number: number of bootstrap runs (default = 1)  
+# returns: list of models, importance, predictions (probability), predictions (raw), indices (which samples had been used for training)
+old_svm_l_clin = runML(df_ml_clin,'svm lin', BS_number = bs)
+old_svm_r_clin = runML(df_ml_clin,'svm rad', BS_number = bs)
+# save results for alter use
+saveRDS(old_svm_l_clin, file = 'results/old_svm_lin_clin.rds')
+saveRDS(old_svm_r_clin, file = 'results/old_svm_rad_clin.rds')
+
+# plot averaged ROC curve
+# takes result object from runML(), the original data frame and path to save plot (optional)
+# returns data frame with values for plot
+old_ROC_curve_l_clin = calculateROC_jpeg(old_svm_l_clin,df_ml_clin,'plots/old_rocc_svml_clin.pdf','plots/old_rocc_svml_clin.jpeg')
+old_ROC_curve_r_clin = calculateROC_jpeg(old_svm_r_clin,df_ml_clin,'plots/old_rocc_svmr_clin.pdf','plots/old_rocc_svmr_clin.jpeg')
+
+# save results for alter use
+write.csv(old_ROC_curve_l_clin, file = 'results/old_rocc_svml_clin.csv')
+write.csv(old_ROC_curve_r_clin, file = 'results/old_rocc_svmr_clin.csv')
+
+# extract weights + plot averaged
+# arguments:  list_from_ML: results from runML()
+#             plot_path:    path to save plot(optional)
+#             number:       number of proteins on plot
+# returns data frame with values for plot
+old_svml_weights_clin = plotWeights_jpeg(old_svm_l_clin,"plots/old_weights_svml_clin.pdf","plots/old_weights_svml_clin.jpeg")
+# save results for later use
+write.csv(old_svml_weights_clin, file = 'results/old_weights_svml_clin.csv')
+```
+
+![SVM weights linear kernel](plots/old_weights_svml_clin.jpeg)
+![ROC plot SVM linear kernel](plots/old_rocc_svml_clin.jpeg)
+![ROC plot SVM radial kernel](plots/old_rocc_svmr_clin.jpeg)
+
+```{r extract weights SVM}
+
+```
+
+
+#### 1.6.4 Dimensionality reduction + supervised learning
+
+Only option for dimensionality reduction would be a-priori selection of variables
+
+### 1.7 Gene set enrichment analysis
+
+```{r gene set enrichment analysis,eval=F}
+
+# load data for background
+background_data = data_frame
+# get background
+background_data = names(background_data)
+
+## get gene set to 
+lm_genes = read.csv('results/weights_lm.csv', row.names = 1)
+lm_genes = setNames(lm_genes$avg,row.names(lm_genes))
+
+# run fgsea
+# arguments:  genes: named (gene name) vector with values (either geneXexpression, or weights from ML models)
+#             min_size: min number of genes to be found in a pathway for it to show up in results (default = 3)
+#             plot_path: path to save plot (optional)
+#             number: number of pathways included in the plot (default = 20)
+#             entrezID: logical, if input data (gene names and background) is entrezid or gene name
+#             background: vector with background genes (optional)
+# returns # returns data frame with values for plot
+gsea_result = gsea_jpeg(lm_genes,background = background_data, min_size = 1, plot_path_pdf = 'plots/fgsea.pdf',plot_path_jpeg = 'plots/fgsea.jpeg')
+gsea_result()
+```
+
+
+### 1.8 AUC combinations
+
+```{r auc combinations, eval = F}
+# bring data in same sample order
+all_data = merge(data_frame, df_patient_info[ ,'status', drop = FALSE], by='row.names')
+row.names(all_data) = all_data$Row.names 
+all_data$Row.names = NULL
+
+###
+# create matrix with average proteins as weight
+###
+
+# load averaged weights
+avgweights = read.csv('results/weights_lm.csv', row.names = 1)
+
+# filter out proteins that were only picked in 1 run
+# remove the ones where error > avg & picked once
+avgweights = avgweights[which(avgweights$picks > 1), ]
+avgweights = avgweights[which(abs(avgweights$avg)>abs(avgweights$error)), ]
+avgweights = as.data.frame(avgweights)
+
+# create data.frame with rows corresponding to all available proteins. Where possible average weights of proteins are stored, all others are 0
+averageweights_m = matrix(nrow=length(names(all_data[ ,!names(all_data) == "status"])), ncol = 1)
+averageweights_m = as.data.frame(averageweights_m)
+averageweights_m[is.na(averageweights_m)] = 0
+rownames(averageweights_m) = names(all_data[ ,!names(all_data) == "status"])
+for(i in 1:nrow(averageweights_m)){
+  for(j in 1:nrow(avgweights)){
+    if(row.names(averageweights_m)[i] == row.names(avgweights)[j]){
+      averageweights_m[i,"V1"] = avgweights[j, "avg"]
+    }
+  }
+}
+
+
+
+#### genes of interest
+genes = c("GPS1", "ADRM1", "LAMA2", "NAP1L1", "CCT8", "PPP1R7", "RAP2A", "SBF1", "PGP")
+
+# Get data frame for plotting with auc for different combinations
+# arguments:    vectornames: character vector of genes of interest
+#               weight_data: data frame as explained above (averageweights_m)
+#               protein_data: data to calculate the auc on (needs protein columns and status column)
+#               maxn: maximal length of combinations (default = length of vectornames)
+#               add: boolean value if combinations should be built, or just cummulative addition of the genes in vectornames
+# returns: data frame with combinations and auc column
+curvy = auccurve(genes, averageweights_m,all_data)
+
+# select colours for bar plot
+farbe = c("#D17480","#C95D6B", "#C14655", "#BA2F40", "#B2182B", "#A01627",	"#8E1322", "#7D111E","#6B0E1A")
+
+# plot overall best combinations
+# number of combinations to plot
+n = 9
+ggplot(curvy[order(curvy$auc, decreasing = T)[1:n], ], aes(x = reorder(paste0(combinations),auc) , y = auc,group = 1)) + geom_line() +
+  theme(axis.text.x = element_text(angle = 0, hjust = 1, face = 'bold', size = 11))+
+  scale_x_discrete(labels = wrap_format(10))+
+  ylab("AUC") +
+  xlab("Genes") +
+  ggtitle("AUC of combinations")
+# save AUC bar  plot
+ggsave("plots/AUCcomb.pdf", width = 11, height = 8, units = "in")
+
+
+# bar plot to show single protein "IMPACT"
+# number of combinations to plot
+n = 9
+ggplot(curvy[c(1:n), ], aes(x = reorder(paste0(combinations),auc), y = auc, fill = reorder(paste0(combinations),auc))) + geom_bar(stat = "identity") +
+  ylab("AUC")  +theme(legend.position = "none", axis.text.x = element_text(face = 'bold', size = 11)) +
+  scale_fill_manual(values = farbe) +
+  xlab("Genes") + scale_y_continuous(breaks = c(0,0.2,0.4,seq(0.5,0.7,0.05)),limits = c(0,0.7))+
+  ggtitle("AUC of single protein models")
+# save AUC bar  plot
+ggsave("plots/AUCbar.pdf", width = 11, height = 8, units = "in")
+
+
+#plot of cumulative
+# run function with 'add = TRUE'
+curvy_add = auccurve(genes, averageweights_m,all_data, add = TRUE)
+
+ggplot(curvy_add, aes(x = paste0(combinations), y = auc,group = 1)) + geom_line() +
+  theme(axis.text.x = element_text(face = 'bold', size = 11))+
+  scale_x_discrete(labels = wrap_format(10))+
+  #scale_y_continuous(breaks = seq(0.55,0.61,0.005), limits = c(0.55,0.61) )+ # eeeh
+  ylab("AUC") +
+  xlab("Genes") + 
+  ggtitle("AUC of models")
+# save adding proteins plot
+ggsave("plots/AUCadd.pdf", width = 11, height = 8, units = "in")
+
+```

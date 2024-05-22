@@ -1,0 +1,366 @@
+---
+title: "gsea_TF"
+author: "Clara Meijs"
+date: "2023-03-16"
+output:
+  html_document:
+    df_print: paged
+    keep_md: yes
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 5
+    theme: lumen
+---
+
+Needed files: 
+
+- The "DE_results_proteomics_first_preprocessing.csv" in the data folder.
+
+## Setting working directories
+
+```{r set-working-directories,message=FALSE,class.source = 'fold-hide'}
+#clean environment
+rm(list=ls())
+
+# if you are using Rstudio run the following command, otherwise, set the working directory to the folder where this script is in
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+
+# create directory for results
+dir.create(file.path(getwd(),'results'), showWarnings = FALSE)
+# create directory for plots
+dir.create(file.path(getwd(),'plots'), showWarnings = FALSE)
+```
+
+## Load data
+
+```{r load data}
+d = read.csv("data/DE_results_proteomics_first_preprocessing.csv")
+length(unique(d$genes)) == length(d$genes) #check if there are no double gene names
+```
+
+## Data preprocessing
+
+```{r data preprocessing}
+library(dplyr)
+
+#if gene name consists of two names with a ; in between, use only first name
+for(i in 1:length(d$genes)){
+  d$genes[i] = unlist(strsplit(d$genes[i], split=';', fixed=TRUE))[1]
+}
+
+#remove duplicate genes with the lowest significance
+d = d %>%
+  group_by(genes) %>%
+  slice_max(log2FC) 
+
+d = na.omit(d) #remove missing
+
+Perseus_significant_0.1 = d$genes[d$Sig=="+"] #make list with genes that were significant according to Perseus
+
+# more_abundant = d$genes[d$Sig=="+" & d$log2FC>0] #create subset of genes that were more abundant
+# less_abundant = d$genes[d$Sig=="+" & d$log2FC<0] #create subset of genes that were less abundant
+# abu = list(Perseus_significant_0.1,more_abundant,less_abundant) #put them in a list together with unselected genes
+# names(abu) = c("all", "more_abundant", "less_abundant") #name list elements
+
+```
+
+## gsea GO data preparation unspecific background
+
+```{r gsea GO data preparation unspecific background}
+library(clusterProfiler)
+library(enrichplot)
+library(ggplot2)
+library(msigdbr)
+
+#make a list with log fold change values and with signed FDR values
+d$signedFDR = d$minlogFDR #take FDR values
+d$signedFDR[d$log2FC<0] = -d$signedFDR[d$log2FC<0] #make FDR values minus where log-fold change is also minus
+dg <- d$log2FC #vector with only log fold change
+dg_FDR = d$signedFDR #vector with only FDR
+names(dg) = names(dg_FDR) = d$genes # gene symbols
+
+```
+
+## Set different variables for gsea analysis
+
+```{r set different variables for gsea analysis}
+
+#we want to run the gsea for different backgrounds, ontologies, adjustments, abundancies, and gene set sizes
+#therefore, we make vectors with the values and matching text vectors for the filenames and titles etc
+
+backgrounds = c("unspecific","specific")
+backgrounds_text = c("with non-specific background","with tear fluid specific background")
+backgrounds_short_text = c("unspecific_background","TF_background")
+ontologies = c("BP", "CC", "MF", "KEGG")
+ontologies_text = c("Biological Process", "Cellular Component", "Molecular Function", "KEGG")
+geneset = list(dg, dg_FDR, dg[Perseus_significant_0.1])
+geneset_text = c("all_genes_logFC", "all_genes_signedFDR" , "Perseus_sig_genes_logFC")
+
+
+      library(dichromat)
+      library(stringr)
+      redblue<-colorRampPalette(c("red","blue"))
+
+```
+
+## New gsea function
+
+```{r new gsea function}
+
+#a function specifically made for the ALS TF project
+
+TF_gsea = function(data,backgr,ont){
+                  
+      #perform gsea
+          
+          dgs = sort(data, decreasing = TRUE)  #sort proteins on decreasing log-fold change (required for gsea)
+        
+      #create background according to the ontology used for the analysis    
+          if(ont != "KEGG"){
+            bg <- msigdbr(species = "Homo sapiens", category = "C5", subcategory = ont) %>% 
+                dplyr::select(gs_name, gene_symbol)
+            if(backgr == "specific"){
+              bg <- bg[bg$gene_symbol %in% names(dg), ]
+            }
+          }else{
+            bg <- msigdbr(species = "Homo sapiens", category = "C2", subcategory = "CP:KEGG") %>% 
+                dplyr::select(gs_name, gene_symbol)
+            if(backgr == "specific"){
+              bg <- bg[bg$gene_symbol %in% names(dg), ]
+            }
+          }
+        
+        #the gsea analysis       
+        gse = GSEA(geneList=dgs, #performing the gsea
+             nPermSimple = 100000, 
+             minGSSize = 3, #minimum gene set size
+             maxGSSize = 800, #maximum gene set size
+             pvalueCutoff = 1, #we don't select for specific p-value yet
+             verbose = TRUE, 
+             TERM2GENE = bg, #background
+             pAdjustMethod = "BH") #benjamini hochberg correction
+        
+      #process gsea results  
+        
+          #if we have no results with less than 0.1 FDR, than we take the best 10 results
+          gse_result = gse@result #from the gsea file we only use the results section to work with
+          if (min(gse_result$p.adjust)<=0.05000) {        #take only pathways with a FDR of 0.1 or lower
+              gse_result_top = gse_result[gse_result$p.adjust<=0.05000,] 
+              } else {
+                if(nrow(gse_result)<10){
+                  gse_result_top = gse_result
+                }else{
+                  gse_result_top = gse_result[1:10,]
+                }
+              
+              }
+          # prettify description text - to lower case and remove ontology term at the start of each pathway name
+          gse_result_top$Description = chartr("_", " ", gse_result_top$Description)
+          gse_result_top$Description = tolower(gse_result_top$Description)
+          if(ont!="KEGG"){
+              gse_result_top$Description = sub('^\\w+\\s', '', gse_result_top$Description)
+            }
+          gse_result_top$Description <- factor(gse_result_top$Description, #sort results on enrichment score
+                                               levels = gse_result_top$Description[order(gse_result_top$enrichmentScore, 
+                                                                                         decreasing = FALSE)])
+          
+      #create labels for barplot
+          
+          gse_result_top$ngenes = gse_result_top$geom_labels =  rep(NA,nrow(gse_result_top)) #make empty vectors for values
+          gse_result_top$sign = rep(" ",nrow(gse_result_top))                 #another empty vector
+          gse_result_top$sign[gse_result_top$p.adjust<0.05] = "*"              #significance level <0.05
+          gse_result_top$sign[gse_result_top$p.adjust<0.01] = "**"              #significance level <0.01
+          gse_result_top$sign[gse_result_top$p.adjust<0.001] = "***"              #significance level <0.001
+          for(o in 1:nrow(gse_result_top)){
+            gse_result_top$ngenes[o] = length(unlist(strsplit(gse_result_top$core_enrichment[o], split='/', fixed=TRUE))) #full number of genes by counting words separated by /
+            gse_result_top$geom_labels[o] = paste0(gse_result_top$ngenes[o],"/", gse_result_top$setSize[o])} #paste gene number + set size and significance level into label vector
+
+       #the gsea analysis       
+        gse2 = GSEA(geneList=dgs, #performing the gsea
+             nPermSimple = 100000, 
+             minGSSize = 3, #minimum gene set size
+             maxGSSize = 800, #maximum gene set size
+             pvalueCutoff = 0.0501, 
+             verbose = TRUE, 
+             TERM2GENE = bg, #background
+             pAdjustMethod = "BH") #benjamini hochberg correction
+
+      return(list(gse, gse_result_top, dgs, gse2))
+
+          }
+```
+
+
+## Final gsea plots
+
+
+```{r final gsea plots}
+
+i = 2 #for now we will only perform analysis with tissue specific background
+      
+        for(h in 1:length(geneset)){
+          #for(i in 1:length(backgrounds)){ #loop for backgrounds
+            for(j in 1:(length(ontologies)-1)){ #loop for ontologies
+              
+              title = paste0("v6_",ontologies[j], "_", backgrounds_short_text[i],"_BH-adj_",geneset_text[h])
+              f_title = paste0("v6_", backgrounds_short_text[i],"_BH-adj_",geneset_text[h])
+              
+              
+              TF_gsea_outcomes = TF_gsea(data =geneset[[h]], ont = ontologies[j], backgr = backgrounds[i])
+              gse =  TF_gsea_outcomes[[1]]
+              gse_result_top= TF_gsea_outcomes[[2]]
+              dgs = TF_gsea_outcomes[[3]]
+              gse2 = TF_gsea_outcomes[[4]]
+              
+              
+      #plot figure individually
+              
+             
+                ggplot(data=gse_result_top, 
+            aes(x=Description, y=gse_result_top$enrichmentScore, fill = p.adjust)) +
+            geom_bar(stat="identity") +
+            coord_flip() +
+            scale_fill_gradientn(colours= redblue(255), 
+                                 breaks=c(0.001,0.01,0.05),
+                                 limits=c(0,0.05)) +
+            theme(panel.grid.major = element_blank(), 
+                  panel.grid.minor = element_blank(), 
+                  #axis.title.x=element_blank(), 
+                  axis.title.y=element_blank(),
+                  panel.background = element_blank(),
+                  text = element_text(size = 13, family="sans"),
+                  axis.line = element_line(colour = "black")) +
+                  labs(
+                  title=title,
+                       y ="Enrichment Score") +
+            geom_text(aes(label = gse_result_top$geom_labels), colour="white", 
+                      position = position_stack(vjust = 0.5)) + 
+            #geom_text(aes(label = gse_result_top$sign), colour="darkgrey", 
+            #                hjust = -0.25) + 
+            guides(fill=guide_colourbar(title="FDR")) +                                # Modify labels of ggplot2 barplot
+            scale_x_discrete(labels = function(x) str_wrap(x, width = 40)) +
+            ylim(-1, 1)
+            
+            
+          #save figure    
+            ggsave(paste0("plots/gsea_top/barplot/gsea_", title,".jpg"), 
+            width = 11/1.2 , height = 0.35*(nrow(gse_result_top)+2), units = "in") #using a formula based on the number of bars to determine the height of the plot
+            ggsave(paste0("plots/gsea_top/barplot/gsea_", title,".pdf"), 
+            width = 11/1.2, height = 0.35*(nrow(gse_result_top)+2), units = "in")
+          
+          #save data
+          write.csv(gse_result_top,paste0("results/gsea_top", title,".csv"))
+
+
+
+      if(nrow(gse2@result>1)){
+  #cnetplot
+            cnetplot(gse2, node_label = 'all', showCategory = 1500, color.params = list(foldChange = dgs))  +
+            ggtitle(paste0("fgsea gene ontology with ",title))
+  
+
+            ggsave(paste0("plots/gsea_top/cnetplot/gsea_", title, "_all_text.jpg"), 
+                 width = 33, height = 24, units = "in")
+            ggsave(paste0("plots/gsea_top/cnetplot/gsea_", title, "_all_text.pdf"), 
+                 width = 33, height = 24, units = "in")
+            
+            cnetplot(gse2, node_label = 'none', showCategory = 1500, color.params = list(foldChange = dgs))  +
+            ggtitle(paste0("fgsea gene ontology with ",title))
+  
+
+            ggsave(paste0("plots/gsea_top/cnetplot/gsea_", title, ".jpg"), 
+                 width = 11, height = 8, units = "in")
+            ggsave(paste0("plots/gsea_top/cnetplot/gsea_", title, ".pdf"), 
+                 width = 11, height = 8, units = "in")
+            
+            #check cnetplot data save data
+            write.csv(gse2@result,paste0("results/cnetplot_data_gsea_top", title,".csv"))
+           #enrichment plot
+              
+              for(k in 1:nrow(gse2@result)){
+                p = gseaplot2(gse2, geneSetID = gse2$Description[k], title = gse2$Description[k], pvalue_table = TRUE, subplots = 1:3)
+                print(p)
+                ggsave(paste0("plots/gsea_top/gseaplot2/gsea_", title, gse2$Description[k] , ".pdf"), 
+                 width = 11, height = 8, units = "in")
+                }
+      }else{
+        print(paste0(title, " has no significant results and therefore no cnetplot and enrichment plot was made"))
+      }       
+      
+      #save results into bigger matrix for the summarizing facet plot
+          
+          gse_result_top$ont = rep(ontologies_text[j], nrow(gse_result_top))
+          if(j==1){ #here we put together the results of one ontology and the previous ontologies
+            gse_result_top_facet = gse_result_top
+            }else{
+              gse_result_top_facet = rbind(gse_result_top_facet,gse_result_top)
+            }
+          }
+      
+          ggplot(data=gse_result_top_facet, 
+            aes(x=Description, y=gse_result_top_facet$enrichmentScore, fill = p.adjust)) +
+            geom_bar(stat="identity") +
+            coord_flip() +
+            scale_fill_gradientn(colours= redblue(255), 
+                                 breaks=c(0.001,0.01,0.05),
+                                 limits=c(0,0.05)) +
+            theme(panel.grid.major = element_blank(), 
+                  panel.grid.minor = element_blank(), 
+                  #axis.title.x=element_blank(), 
+                  axis.title.y=element_blank(),
+                  panel.background = element_blank(),
+                  text = element_text(size = 13, family="sans"),
+                  axis.line = element_line(colour = "black")) +
+                  labs(title = backgrounds_text[i], 
+                       y ="Enrichment Score") +
+            geom_text(aes(label = gse_result_top_facet$geom_labels), colour="white", 
+                      position = position_stack(vjust = 0.5)) + 
+            guides(fill=guide_colourbar(title="FDR")) +                                # Modify labels of ggplot2 barplot
+            scale_x_discrete(labels = function(x) str_wrap(x, width = 40)) +
+            ylim(-1, 1) +
+            facet_grid(rows = vars(ont), scales="free", space = "free")
+        
+
+          #save figure    
+                 ggsave(paste0("plots/gsea_top/barplot/gsea_facet_",f_title,
+                        ".jpg"), 
+                 width = 11/1.5 , height = 0.35*(nrow(gse_result_top_facet)+2), units = "in")
+                ggsave(paste0("plots/gsea_top/barplot/gsea_facet_",f_title,
+                        ".pdf"), 
+                 width = 11/1.5, height = 0.35*(nrow(gse_result_top_facet)+2), units = "in")
+
+            
+                        #}
+}
+          
+
+```
+
+## Scatterplot comparing signed FDR and foldchange
+
+```{r scatterplot comparing signed FDR and foldchange}
+d2 = as.data.frame(cbind(dg, d$minlogFDR))
+d3 = d2[Perseus_significant_0.1,]
+
+ggplot(d2, aes(x=dg, y=V2,colour=as.factor(d$Sig))) +
+  geom_point()+
+geom_text(data=d3,
+            aes(dg,V2,label=rownames(d3)),
+          check_overlap=T, colour = "black")+
+theme(#panel.grid.major = element_blank(), 
+                  panel.grid.minor = element_blank(), 
+                  #axis.title.x=element_blank(), 
+                  #axis.title.y=element_blank(),
+                  panel.background = element_blank()) + 
+  
+labs(title="plotting log fold change against the signed FDR",
+     y = "signed FDR",
+     x = "log fold change")
+
+
+```
+
+
+
+

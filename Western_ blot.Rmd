@@ -1,0 +1,627 @@
+---
+title: "Western blot models"
+author: "Clara Meijs"
+date: "2023-01-24"
+output:
+  html_document:
+    df_print: paged
+    keep_md: yes
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 5
+    theme: lumen
+  pdf_document:
+    keep_tex: yes
+    toc: yes
+    toc_depth: 2
+    fig_caption: yes
+    fig_crop: no
+    highlight: haddock
+    number_sections: yes
+---
+
+## Prepare libraries and directories
+
+Start with clearing environment and loading packages
+
+```{r libraries, results='hide', message=FALSE,class.source = 'fold-hide'}
+rm(list=ls())
+
+library('ggplot2')
+library('tidyverse')
+#library('Rtsne')
+library('umap')
+library('pheatmap')
+#library('RColorBrewer')
+##library("factoextra")
+library("viridis")
+library("dplyr")
+library('caret')
+#library('ranger')
+library('glmnet')
+library('pROC')
+#library('RobustRankAggreg')
+library('matrixStats') # row standard deviation
+#library('ggthemr')
+#library('fgsea')
+#library('org.Hs.eg.db')
+#library('uwot')
+#library('h2o')
+#library('kernlab')
+#library('scales')
+library('naniar')
+#library('plyr')
+#library('mice')
+library('impute')
+#library('readxl')
+
+```
+
+Setting directory to correct map and create directory for output:
+
+```{r set-working-directories,message=FALSE,class.source = 'fold-hide'}
+# if you are using Rstudio run the following command, otherwise, set the working directory to the folder where this script is in
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+
+# create directory for results
+dir.create(file.path(getwd(),'results'), showWarnings = FALSE)
+# create directory for plots
+dir.create(file.path(getwd(),'plots'), showWarnings = FALSE)
+```
+## Data preprocessing 
+
+Load data, and have a look at it
+
+```{r load new data,message=FALSE}
+# LOAD DATA
+# data frame 1: col names = patientID, protein expression values (rows) and precursor count
+# data frame 2: row names = patientID, patientinfo (columns), status column values: Group 1 and Group 2
+
+datasets = list()
+datasets[[1]] = read.delim2("data/WB_expression_RD.txt")
+datasets[[2]] = read.delim2("data/WB_expression_RDG.txt")
+names(datasets) = c("RD_raw","RDG_raw")
+#pat_info <- read.delim("data/New_proteomics_data_patient_overview.tsv", comment.char="#")
+
+for(i in 1:length(datasets)){
+  datasets[[i]] = datasets[[i]][1:104,] #remove weird empty rows
+  datasets[[i]]$status = as.factor(datasets[[i]]$status)
+}
+```
+
+```{r clinical data}
+library(readxl)
+clin <- read_excel("data/clean_clinical_data_WB.xlsx")
+clin$sex = as.factor(clin$sex)
+levels(clin$sex) = c("w","m")
+datasets[[1]] <- merge(clin[,1:5], datasets[[1]], by = "patid")
+datasets[[2]] <- merge(clin[,1:5], datasets[[2]], by = "patid")
+
+#rownamesp_d) = p_d$patid
+```
+
+```{r log-transformation and z-score standardization}
+#log transform data
+    RD_log = datasets[["RD_raw"]]
+    RD_log[,7:ncol(RD_log)] = log(RD_log[,7:ncol(RD_log)])
+    RD_log[RD_log == -Inf] <- 0
+    
+    RDG_log = datasets[["RDG_raw"]]
+    RDG_log[,7:ncol(RDG_log)] = log(RDG_log[,7:ncol(RDG_log)])
+    RDG_log[RDG_log == -Inf] <- 0
+
+#z-score standardize
+    RD_log_z = RD_log
+    for(i in 7:ncol(RD_log_z)){
+      RD_log_z[,i] = as.numeric(scale(RD_log_z[,i], center = TRUE, scale = TRUE))
+    }
+    RD_log_z[,7:ncol(RD_log_z)] = as.data.frame(as.matrix(RD_log_z[,7:ncol(RD_log_z)])) # to remove attributes that are causing errors in the mice function
+    
+    RDG_log_z = RDG_log
+    for(i in 7:ncol(RDG_log_z)){
+      RDG_log_z[,i] = scale(RDG_log_z[,i], center = TRUE, scale = TRUE)
+    }
+    RDG_log_z[,7:ncol(RD_log_z)] = as.data.frame(as.matrix(RDG_log_z[,7:ncol(RD_log_z)])) # to remove attributes that are causing errors in the mice function
+    
+    #make values numeric again
+    for(i in 6:ncol(RD_log_z)){
+      if(i == 6){
+        RD_log_z[,i] = as.factor(RD_log_z[,i])
+      RDG_log_z[,i] = as.factor(RDG_log_z[,i])
+      }
+      if(i > 6){
+        RD_log_z[,i] = as.numeric(RD_log_z[,i])
+      RDG_log_z[,i] = as.numeric(RDG_log_z[,i])
+      }
+    }
+    
+    datasets = c(datasets,list(RD_log, RDG_log, RD_log_z, RDG_log_z))
+    names(datasets)[3:6] = c("RD_log", "RDG_log", "RD_log_z", "RDG_log_z")
+```
+
+
+```{r standardize between 1 and 0?}
+
+datasets[[7]] = datasets[["RD_log"]]
+datasets[[8]] = datasets[["RDG_log"]]
+names(datasets)[7:8] = c("RD_log_01", "RDG_log_01")
+
+for(i in 7:8){
+    for(j in 7:ncol( datasets[[i]])){
+     datasets[[i]][,j] =  datasets[[i]][,j] - min(datasets[[i]][,j], na.rm = T)
+     datasets[[i]][,j] =  datasets[[i]][,j] / max( datasets[[i]][,j], na.rm = T)
+  }
+}
+```
+
+```{r filtering for too many missing values}
+      # delete rows with more than 70% percent missing
+
+      k = length(datasets)
+      
+      for(j in 1:k){
+        miss <- c()
+      for(i in 1:nrow(datasets[[j]])) {
+        if(length(which(is.na(datasets[[j]][i,7:ncol(datasets[[j]])]))) > 0.7*(ncol(datasets[[j]])-5)) miss <- append(miss,i)
+      }
+      k = k + 1  
+      datasets[[k]] <- datasets[[j]][-miss,]
+      names(datasets)[k]  = paste0(names(datasets)[j],"_f")
+      }
+      
+```
+
+```{r KNN imputation}
+
+k = length(datasets)
+l = k/2+1 #use only second half of the datasets for imputation, the datasets that are filtered
+
+  for(i in l:k){
+    d = datasets[[i]][,7:ncol(datasets[[i]])]
+    imp = impute.knn(t(d) ,k = 10, rowmax = 0.6, colmax = 0.70, maxp = 1500, rng.seed=362436069)
+    k = k+1
+    datasets[[k]] =
+      cbind(
+        datasets[[i]][,1:6],
+        as.data.frame(t(imp$data)))
+    names(datasets)[k] = paste0(names(datasets)[i],"_knn")
+  }
+```
+
+```{r other imputations?}
+#source(file="~/My_Drive/1Documents_1/Studie/PhD/Proj_ALS_tear_fluid/Claras_code/Western_blot_model/data/DEPfunctions.R")
+```
+
+## Figures
+
+```{r Figures missingness}
+for(i in 1:length(datasets)){
+  vis_miss(datasets[[i]][,7:ncol(datasets[[i]])],warn_large_data = F) #visualise missing new dataset
+      ggsave(paste0("plots/viss_miss_", names(datasets)[i], ".jpg"), width = 11, height = 5, units = "in")
+      ggsave(paste0("plots/viss_miss_", names(datasets)[i], ".pdf"), width = 11, height = 5, units = "in")
+}
+```
+
+```{r Figures boxplots}
+for(i in 1:length(datasets)){
+      datasets[[i]] %>% dplyr::select(status, CRYM, CAPZA2, ALDHA6A1, PFKL, SERPINC1, HP) %>%
+            pivot_longer(., cols = c(CRYM, CAPZA2, ALDHA6A1, PFKL, SERPINC1, HP), names_to = "Var", values_to = "Val") %>%
+            ggplot(aes(x = Var, y = Val, fill = status)) +
+            geom_boxplot() +
+            ggtitle(paste0("Boxplot ",names(datasets)[i])) +
+            theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+  
+      ggsave(paste0("plots/boxplot_", names(datasets)[i], ".jpg"), width = 11, height = 5, units = "in")
+      ggsave(paste0("plots/boxplot_", names(datasets)[i], ".pdf"), width = 11, height = 5, units = "in")
+      
+      datasets[[i]] %>% dplyr::select(status, CRYM, CAPZA2, ALDHA6A1, PFKL, SERPINC1, HP) %>%
+        pivot_longer(., cols = c(CRYM, CAPZA2, ALDHA6A1, PFKL, SERPINC1, HP), names_to = "Var", values_to = "Val") %>% ggplot(aes(x = Val, y = Var)) +
+  # horizontal boxplots & density plots
+  geom_boxplot(aes(fill = status)) +
+  geom_density(aes(x = Val,  fill = status), inherit.aes = FALSE) +
+  ggtitle(paste0("Boxplot plus density ",names(datasets)[i])) +
+  facet_grid(status ~ .) +
+  scale_fill_discrete()
+
+      ggsave(paste0("plots/box_density_", names(datasets)[i], ".jpg"), width = 11, height = 5, units = "in")
+      ggsave(paste0("plots/box_density_", names(datasets)[i], ".pdf"), width = 11, height = 5, units = "in")
+      print(i)
+}
+```
+
+```{r Figures UMAP}
+# set seed for reproducible results
+set.seed(9)
+k = length(datasets)
+l = 17 #use only complete datasets for umap
+
+for(i in l:k){
+        # run umap function from umap package
+      d = datasets[[i]]
+      umap_out = umap::umap(d[,!names(d) == "patid" & 
+                                !names(d) == "status" & 
+                                !names(d) == "age" & 
+                                !names(d) == "sex" & 
+                                !names(d) == "diagnosis" & 
+                                !names(d) == "stratum_of_onset"])
+      # extract values for plot
+      umap_plot = as.data.frame(umap_out$layout)
+      
+      # add status to data frame for plotting
+      if(all(rownames(umap_plot) == rownames(d))){
+        umap_plot$group = d$status
+      }
+      
+      # plot umap
+      ggplot(umap_plot) + geom_point(aes(x=V1, y=V2, color = as.factor(group))) +
+        ggtitle(paste0("UMAP WB ",names(datasets[i]))) +
+        scale_color_manual(name = "Group", labels = c("ALS", "ctrl"), values = c("purple","orange"))
+      # save umap
+      ggsave(paste0("plots/umap_WB_status_",names(datasets[i]),".jpg"), width = 6, height = 4, units = "in")
+      ggsave(paste0("plots/umap_WB_status_",names(datasets[i]),".pdf"), width = 11, height = 8, units = "in")
+}
+
+```
+
+```{r Figures heatmap}
+
+#functions for saving the heatmaps as figures
+        
+        save_pheatmap_pdf <- function(x, filename, width=11, height=8) {
+           stopifnot(!missing(x))
+           stopifnot(!missing(filename))
+           pdf(filename, width=width, height=height)
+           grid::grid.newpage()
+           grid::grid.draw(x$gtable)
+           dev.off()
+        }
+        
+        save_pheatmap_jpg <- function(x, filename, width=600, height=400) {
+           stopifnot(!missing(x))
+           stopifnot(!missing(filename))
+           jpeg(filename, width=width, height=height)
+           grid::grid.newpage()
+           grid::grid.draw(x$gtable)
+           dev.off()
+        }
+        
+# set seed for reproducible results
+        
+set.seed(9)
+k = length(datasets)
+l = 17 #use only complete datasets for umap
+
+for(i in l:k){
+
+# get annotations ready
+        
+        d = datasets[[i]]
+        
+        annotation = data.frame(group = as.factor(d$status),
+                               sex = as.factor(d$sex),
+                               #onset = as.factor(d$stratum_of_onset),
+                               age = as.numeric(d$age))
+                               
+        
+        #annotation = data.frame(group = as.factor(d$status))
+        
+        rownames(annotation) = rownames(d)
+                
+        annotation_colours <- list(
+         group = c(CTR = "#000000", ALS = "#B2182B"),
+         sex = c(w = "lightpink1", m ="skyblue1"),
+         #onset = c(spinal = "yellow", bulbar = "orange", axial = "red"),
+         age = c("white", "darkgreen"))
+        
+        # annotation_colours <- list(
+        #   group = c(CTR = "#000000", ALS = "#B2182B") 
+        #   )
+
+
+# save and plot heatmap without grouping 
+
+        p = pheatmap::pheatmap(t(d[,7:ncol(d)]), 
+                 treeheight_row = 0, treeheight_col = 0,
+                 name = "expression",
+                 cutree_cols = 1,
+                 show_colnames = F,
+                 show_rownames = T,
+                 fontsize = 6,
+                 annotation_col = annotation,
+                 annotation_colors = annotation_colours,
+                 color = viridis::viridis(100, option="C", direction = -1,),
+                 main = paste0("Heatmap ungrouped with dataset ",names(datasets)[i]))
+        
+        save_pheatmap_pdf(p, paste0("plots/heatmap_ungrouped_",names(datasets)[i],".pdf"))
+        
+        save_pheatmap_jpg(p, paste0("plots/heatmap_ungrouped_",names(datasets)[i],".jpg"))
+        
+    # heatmap grouped according to onset
+
+        d = d[order(abs(as.numeric(d$status)), decreasing = FALSE), ]
+        
+        p = pheatmap::pheatmap(t(d[,7:ncol(d)]), 
+                 treeheight_row = 0, treeheight_col = 0,
+                 name = "expression",
+                 cutree_cols = 1,
+                 show_colnames = F,
+                 show_rownames = T,
+                 fontsize = 6,
+                 annotation_col = annotation,
+                 annotation_colors = annotation_colours,
+                 color = viridis::viridis(100, option="C", direction = -1,),
+                 main = paste0("Heatmap grouped on status with dataset ",names(datasets)[i]),
+                 cluster_cols = F)
+        
+        save_pheatmap_pdf(p, paste0("plots/heatmap_grouped_status_",names(datasets)[i],".pdf"))
+        
+        save_pheatmap_jpg(p, paste0("plots/heatmap_grouped_status_",names(datasets)[i],".jpg"))
+}
+
+```
+
+
+```{r save datasets}
+save(datasets,file = "results/datasets.RData")
+```
+
+## Modeling
+
+```{r simple DEx}
+
+      library(limma)
+      library(IceR)
+
+      DE = list()
+
+      for(j in 1:length(datasets)){
+      
+          d = as.data.frame(t(datasets[[j]]))
+          status = as.factor(as.character(d[6,]))
+          
+          d = d[7:nrow(d),]
+          for(i in 1:ncol(d)){d[,i] = as.numeric(d[,i])}
+          
+          DE[[j]] = LIMMA_analysis(
+              data = d,
+              assignments = status)
+      }
+      
+      names(DE) = names(datasets)
+      
+      save(DE,file = "results/DE_results.RData")
+      
+      sigDE = matrix(, nrow = 12, ncol = length(DE))
+      rownames(sigDE) = c(paste0("not_adjusted_",rownames(DE[[1]])),paste0("adjusted_",rownames(DE[[1]])))
+      colnames(sigDE) = names(DE)
+      
+      for(i in 1:length(DE)){
+        d = DE[[i]]
+        sigDE[,i] = c(d[rownames(DE[[1]]),4],d[rownames(DE[[1]]),5])
+      }
+      
+      p = pheatmap::pheatmap(sigDE, treeheight_row = 0, treeheight_col = 0, 
+                         display_numbers = round(sigDE,2),
+                         cluster_rows = F, cluster_cols = F)
+      
+        save_pheatmap_pdf(p, "plots/heatmap_differential_expression_significance.pdf")
+        
+        save_pheatmap_jpg(p, "plots/heatmap_differential_expression_significance.jpg")
+      
+
+```
+
+
+```{r load jennys functions}
+source("data/jennys_functions.R")
+```
+
+```{r set number of bootstrapping}
+bs=500
+```
+
+```{r modelling without clinical variables}
+
+set.seed(9)
+k = length(datasets)
+l = 17 #use only imputed datasets 
+
+for(i in l:k){
+        
+      d = datasets[[i]]
+      d$status = (as.numeric(d$status)-1) #adjust status column
+      d = d[,!names(d) == "patid" & 
+              !names(d) == "age" & 
+              !names(d) == "sex" & 
+              !names(d) == "diagnosis" & 
+              !names(d) == "stratum_of_onset"] #remove patid column
+      
+      #build models
+      lm = runML(d,'lm', BS_number = bs)
+      svm_l = runML(d,'svm lin', BS_number = bs) 
+      svm_r = runML(d,'svm rad', BS_number = bs)
+      #rf = runML(d,'rf', BS_number = bs) 
+      
+      #save models
+      saveRDS(lm, file = paste0("results/model_lm_",names(datasets)[i],".rds")) 
+      saveRDS(svm_l, file = paste0("results/model_svm_l_",names(datasets)[i],".rds")) 
+      saveRDS(svm_r, file = paste0("results/model_svm_r_",names(datasets)[i],".rds"))
+      #saveRDS(rf, file = paste0("results/model_rf_",names(datasets)[i],".rds")) 
+      
+      #load models
+      #lm = readRDS(file = paste0("results/model_lm_",names(datasets)[i],".rds")) 
+      #svm_l = readRDS(file = paste0("results/model_svm_l_",names(datasets)[i],".rds")) 
+      #svm_r = readRDS(file = paste0("results/model_svm_l_",names(datasets)[i],".rds")) 
+      #lm = readRDS(file = paste0("results/model_rf_",names(datasets)[i],".rds")) 
+      
+      #produce ROC curves
+      ROC_curve_lm = calculateROC_jpeg(lm, d, 
+                                    paste0("plots/rocc_lm_",names(datasets)[i],".pdf"),
+                                    paste0("plots/rocc_lm_",names(datasets)[i],".jpeg"))
+      ROC_curve_svm_l = calculateROC_jpeg(svm_l, d, 
+                                    paste0("plots/rocc_svm_l_",names(datasets)[i],".pdf"),
+                                    paste0("plots/rocc_svm_l_",names(datasets)[i],".jpeg")) 
+      ROC_curve_svm_r = calculateROC_jpeg(svm_r, d, 
+                                    paste0("plots/rocc_svm_r_",names(datasets)[i],".pdf"),
+                                    paste0("plots/rocc_svm_r_",names(datasets)[i],".jpeg")) 
+      #ROC_curve_rf = calculateROC_jpeg(rf, d, 
+      #                              paste0("plots/rocc_rf_",names(datasets)[i],".pdf"),
+      #                              paste0("plots/rocc_rf_",names(datasets)[i],".jpeg")) 
+      
+      #plot weights (not possible for svm radial)
+      lm_weights = plotWeights_jpeg(lm, 
+                                    paste0("plots/weights_lm_",names(datasets)[i],".pdf"),
+                                    paste0("plots/weights_lm_",names(datasets)[i],".jpeg"))
+      svm_l_weights = plotWeights_jpeg(svm_l, 
+                                    paste0("plots/weights_svm_l_",names(datasets)[i],".pdf"),
+                                    paste0("plots/weights_svm_l_",names(datasets)[i],".jpeg"))
+      #rf_weights = plotWeights_jpeg(rf, 
+      #                              paste0("plots/weights_rf_",names(datasets)[i],".pdf"),
+      #                              paste0("plots/weights_rf_",names(datasets)[i],".jpeg"))
+      
+      #save data ROC curve
+      write.csv(ROC_curve_lm, file = paste0("results/rocc_lm_",names(datasets)[i],".csv"))
+      write.csv(ROC_curve_svm_l, file = paste0("results/rocc_svm_l_",names(datasets)[i],".csv"))
+      write.csv(ROC_curve_svm_r, file = paste0("results/rocc_svm_r_",names(datasets)[i],".csv"))
+      #write.csv(ROC_curve_rf, file = paste0("results/rocc_lm_rf_",names(datasets)[i],".csv"))
+
+}
+
+```
+
+```{r modelling with only clinical variables}
+
+set.seed(9)
+k = length(datasets)
+l = 17 #use only imputed datasets 
+
+for(i in l:k){
+        
+      d = datasets[[i]]
+      d$status = (as.numeric(d$status)-1) #adjust status column
+      d$sex = (as.numeric(d$sex)-1) #adjust sex column
+      
+      #only select the columns status, age, and sex
+      d = d[,c("status","age","sex")] #remove patid column
+      
+      #build models
+      lm = runML(d,'lm', BS_number = bs)
+      svm_l = runML(d,'svm lin', BS_number = bs) 
+      svm_r = runML(d,'svm rad', BS_number = bs)
+      #rf = runML(d,'rf', BS_number = bs) 
+      
+      #save models
+      saveRDS(lm, file = paste0("results/model_lm_only_clin_",names(datasets)[i],".rds")) 
+      saveRDS(svm_l, file = paste0("results/model_svm_l_only_clin_",names(datasets)[i],".rds")) 
+      saveRDS(svm_r, file = paste0("results/model_svm_r_only_clin_",names(datasets)[i],".rds"))
+      #saveRDS(rf, file = paste0("results/model_rf_",names(datasets)[i],".rds")) 
+      
+      #load models
+      #lm = readRDS(file = paste0("results/model_lm_",names(datasets)[i],".rds")) 
+      #svm_l = readRDS(file = paste0("results/model_svm_l_",names(datasets)[i],".rds")) 
+      #svm_r = readRDS(file = paste0("results/model_svm_l_",names(datasets)[i],".rds")) 
+      #lm = readRDS(file = paste0("results/model_rf_",names(datasets)[i],".rds")) 
+      
+      #produce ROC curves
+      ROC_curve_lm = calculateROC_jpeg(lm, d, 
+                                    paste0("plots/rocc_lm_only_clin_",names(datasets)[i],".pdf"),
+                                    paste0("plots/rocc_lm_only_clin_",names(datasets)[i],".jpeg"))
+      ROC_curve_svm_l = calculateROC_jpeg(svm_l, d, 
+                                    paste0("plots/rocc_svm_l_only_clin_",names(datasets)[i],".pdf"),
+                                    paste0("plots/rocc_svm_l_only_clin_",names(datasets)[i],".jpeg")) 
+      ROC_curve_svm_r = calculateROC_jpeg(svm_r, d, 
+                                    paste0("plots/rocc_svm_r_only_clin_",names(datasets)[i],".pdf"),
+                                    paste0("plots/rocc_svm_r_only_clin_",names(datasets)[i],".jpeg")) 
+      #ROC_curve_rf = calculateROC_jpeg(rf, d, 
+      #                              paste0("plots/rocc_rf_",names(datasets)[i],".pdf"),
+      #                              paste0("plots/rocc_rf_",names(datasets)[i],".jpeg")) 
+      
+      #plot weights (not possible for svm radial)
+      lm_weights = plotWeights_jpeg(lm, 
+                                    paste0("plots/weights_lm_only_clin_",names(datasets)[i],".pdf"),
+                                    paste0("plots/weights_lm_only_clin_",names(datasets)[i],".jpeg"))
+      svm_l_weights = plotWeights_jpeg(svm_l, 
+                                    paste0("plots/weights_svm_l_only_clin_",names(datasets)[i],".pdf"),
+                                    paste0("plots/weights_svm_l_only_clin_",names(datasets)[i],".jpeg"))
+      #rf_weights = plotWeights_jpeg(rf, 
+      #                              paste0("plots/weights_rf_",names(datasets)[i],".pdf"),
+      #                              paste0("plots/weights_rf_",names(datasets)[i],".jpeg"))
+      
+      #save data ROC curve
+      write.csv(ROC_curve_lm, file = paste0("results/rocc_lm_only_clin_",names(datasets)[i],".csv"))
+      write.csv(ROC_curve_svm_l, file = paste0("results/rocc_svm_l_only_clin_",names(datasets)[i],".csv"))
+      write.csv(ROC_curve_svm_r, file = paste0("results/rocc_svm_r_only_clin_",names(datasets)[i],".csv"))
+      #write.csv(ROC_curve_rf, file = paste0("results/rocc_lm_rf_",names(datasets)[i],".csv"))
+
+}
+
+```
+
+```{r modelling including clinical variables}
+
+set.seed(9)
+k = length(datasets)
+l = 17 #use only imputed datasets 
+
+for(i in l:k){
+        
+      d = datasets[[i]]
+      d$status = (as.numeric(d$status)-1) #adjust status column
+      d$sex = (as.numeric(d$sex)-1) #adjust status column
+      d = d[,!names(d) == "patid" & 
+              !names(d) == "diagnosis" & 
+              !names(d) == "stratum_of_onset"] #remove patid column
+      
+      #build models
+      lm = runML(d,'lm', BS_number = bs)
+      svm_l = runML(d,'svm lin', BS_number = bs) 
+      svm_r = runML(d,'svm rad', BS_number = bs)
+      #rf = runML(d,'rf', BS_number = bs) 
+      
+      #save models
+      saveRDS(lm, file = paste0("results/model_lm_plus_clin_",names(datasets)[i],".rds")) 
+      saveRDS(svm_l, file = paste0("results/model_svm_l_plus_clin_",names(datasets)[i],".rds")) 
+      saveRDS(svm_r, file = paste0("results/model_svm_r_plus_clin_",names(datasets)[i],".rds"))
+      #saveRDS(rf, file = paste0("results/model_rf_",names(datasets)[i],".rds")) 
+      
+      #load models
+      #lm = readRDS(file = paste0("results/model_lm_",names(datasets)[i],".rds")) 
+      #svm_l = readRDS(file = paste0("results/model_svm_l_",names(datasets)[i],".rds")) 
+      #svm_r = readRDS(file = paste0("results/model_svm_l_",names(datasets)[i],".rds")) 
+      #lm = readRDS(file = paste0("results/model_rf_",names(datasets)[i],".rds")) 
+      
+      #produce ROC curves
+      ROC_curve_lm = calculateROC_jpeg(lm, d, 
+                                    paste0("plots/rocc_lm_plus_clin_",names(datasets)[i],".pdf"),
+                                    paste0("plots/rocc_lm_plus_clin_",names(datasets)[i],".jpeg"))
+      ROC_curve_svm_l = calculateROC_jpeg(svm_l, d, 
+                                    paste0("plots/rocc_svm_l_plus_clin_",names(datasets)[i],".pdf"),
+                                    paste0("plots/rocc_svm_l_plus_clin_",names(datasets)[i],".jpeg")) 
+      ROC_curve_svm_r = calculateROC_jpeg(svm_r, d, 
+                                    paste0("plots/rocc_svm_r_plus_clin_",names(datasets)[i],".pdf"),
+                                    paste0("plots/rocc_svm_r_plus_clin_",names(datasets)[i],".jpeg")) 
+      #ROC_curve_rf = calculateROC_jpeg(rf, d, 
+      #                              paste0("plots/rocc_rf_",names(datasets)[i],".pdf"),
+      #                              paste0("plots/rocc_rf_",names(datasets)[i],".jpeg")) 
+      
+      #plot weights (not possible for svm radial)
+      lm_weights = plotWeights_jpeg(lm, 
+                                    paste0("plots/weights_lm_plus_clin_",names(datasets)[i],".pdf"),
+                                    paste0("plots/weights_lm_plus_clin_",names(datasets)[i],".jpeg"))
+      svm_l_weights = plotWeights_jpeg(svm_l, 
+                                    paste0("plots/weights_svm_l_plus_clin_",names(datasets)[i],".pdf"),
+                                    paste0("plots/weights_svm_l_plus_clin_",names(datasets)[i],".jpeg"))
+      #rf_weights = plotWeights_jpeg(rf, 
+      #                              paste0("plots/weights_rf_",names(datasets)[i],".pdf"),
+      #                              paste0("plots/weights_rf_",names(datasets)[i],".jpeg"))
+      
+      #save data ROC curve
+      write.csv(ROC_curve_lm, file = paste0("results/rocc_lm_plus_clin_",names(datasets)[i],".csv"))
+      write.csv(ROC_curve_svm_l, file = paste0("results/rocc_svm_l_plus_clin_",names(datasets)[i],".csv"))
+      write.csv(ROC_curve_svm_r, file = paste0("results/rocc_svm_r_plus_clin_",names(datasets)[i],".csv"))
+      #write.csv(ROC_curve_rf, file = paste0("results/rocc_lm_rf_",names(datasets)[i],".csv"))
+
+}
+
+```

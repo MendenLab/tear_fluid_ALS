@@ -1,0 +1,929 @@
+---
+title: "Sanity check tear fluid"
+author: "Clara Meijs"
+date: "2022-12-06"
+output:
+  html_document:
+    df_print: paged
+    keep_md: yes
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+    toc_depth: 5
+    theme: lumen
+---
+
+## 0 Preparatory activities
+
+Start with clearing environment and loading packages
+
+```{r libraries, results='hide', message=FALSE,class.source = 'fold-hide'}
+rm(list=ls())
+
+library('ggplot2')
+library('tidyverse')
+library('Rtsne')
+library('umap')
+library('pheatmap')
+library('RColorBrewer')
+library("factoextra")
+library("viridis")
+library("dplyr")
+library('caret')
+library('ranger')
+library('glmnet')
+library('pROC')
+library('RobustRankAggreg')
+library('matrixStats') # row standard deviation
+library('fgsea')
+library('org.Hs.eg.db')
+library('uwot')
+library('h2o')
+library('kernlab')
+library('scales')
+library('naniar')
+library('plyr')
+library('mice')
+library('impute')
+library('readxl')
+
+
+
+# define colours for plots
+farben = viridis(2, option="C", direction = -1, begin = 0.2, end = 0.8)
+```
+
+Setting directory to correct map and create directory for output:
+
+```{r set-working-directories,message=FALSE,class.source = 'fold-hide'}
+# if you are using Rstudio run the following command, otherwise, set the working directory to the folder where this script is in
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+
+# create directory for results
+dir.create(file.path(getwd(),'results'), showWarnings = FALSE)
+# create directory for plots
+dir.create(file.path(getwd(),'plots'), showWarnings = FALSE)
+```
+
+## Data preprocessing 
+
+Load data, and have a look at it
+
+```{r load new data,message=FALSE}
+# LOAD DATA
+# data frame 1: col names = patientID, protein expression values (rows) and precursor count
+# data frame 2: row names = patientID, patientinfo (columns), status column values: Group 1 and Group 2
+rm(list=ls())
+
+p_raw_data <- read.delim("data/New_proteomics_data_expression.txt")
+p_patient_info <- read.delim("data/New_proteomics_data_patient_overview.tsv", comment.char="#")
+p_info <- read_excel("data/new_patient_data_clean.xlsx")
+
+p_d = p_raw_data[,grep("PG.Quantity", colnames(p_raw_data))] 
+p_d  = as.data.frame(t(p_d))
+p = as.data.frame(matrix(NA, nrow = nrow(p_patient_info), ncol = 2))
+colnames(p)=c("group","patid")
+
+for(i in 1:length(p_patient_info$FileName)){
+p[i,1] = unlist(strsplit(p_patient_info$FileName[i], split='_', fixed=TRUE))[5]
+p[i,2] = unlist(strsplit(p_patient_info$FileName[i], split='_', fixed=TRUE))[7]
+}
+
+p[41:42,1] = "B"
+
+```
+
+
+```{r clean and make numeric, message=FALSE}
+p_d[p_d == "Filtered"] <- NA
+p_d[p_d == "NaN"] <- NA
+for(i in 1:ncol(p_d)){p_d[,i]=str_replace_all(p_d[,i], ",", ".")} #change all commas in dataset to dots
+p_d = data.frame(lapply(p_d,as.numeric))
+```
+
+
+```{r divide dataset in two sets and take mean expressions}
+p_d = cbind(as.numeric(p$patid),p_d)
+colnames(p_d)[1] = "patid"
+
+p_d_A = p_d[p$group=="A",]
+p_d_B = p_d[p$group=="B",]
+
+p_d_A <- p_d_A[order(p_d_A[,1]),]
+p_d_B <- p_d_B[order(p_d_B[,1]),]
+
+#patient 70 is only present in p_d_A, patient 10 occurs twice in p_d_B
+#remove second occurence patient 10
+p_d_B = p_d_B[-11,]
+
+v = c(1:max(p_d_A$patid))
+
+p_d = as.data.frame(matrix(data=NA,ncol = ncol(p_d_A), nrow = nrow (p_d_A)))
+#take mean of every value, combining dataset A and B
+for(j in 1:ncol(p_d)){
+  for(i in 1:nrow(p_d)){
+    p_d[i,j] = mean(c(
+      p_d_A[p_d_A$patid==v[i],j], 
+      p_d_B[p_d_B$patid==v[i],j]),
+      na.rm=TRUE)
+  }}
+
+colnames(p_d)[1] = "patid"
+```
+
+```{r clinical data}
+
+clin <- read_excel("data/new_patient_data_clean.xlsx")
+
+#only take patid from the whole name
+for(i in 1:length(clin$patid1)){
+clin$patid1[i] = unlist(strsplit(clin$patid1[i], split='_', fixed=TRUE))[2]
+}
+clin$patid1 = as.numeric(clin$patid1)
+clin = clin[,-2] #remove patid2 column
+clin$onset = as.numeric(clin$onset) # one entry was "1 oder 3" and that has become NA
+colnames(clin)[1] = "patid"
+clin_stat = as.data.frame(cbind(clin$patid, clin$status))
+colnames(clin_stat) = c("patid","status")
+clin_stat$patid = as.numeric(clin_stat$patid)
+
+#patient 31 has moved to control, therefore duplicate in table
+clin_stat[31,2] = "control"
+clin_stat = clin_stat[-107,] #remove duplicate
+
+p_d <- merge(clin_stat, p_d, by = "patid")
+rownames(p_d) = p_d$patid
+
+#in dataset, patient 18, 27 and 49 should be removed --> see original patient dataset
+p_d = p_d[p_d$patid!=18 & p_d$patid!=27 & p_d$patid!=49 ,]
+
+p_d = p_d[,-1] #remove patid column because it is already in the rownames
+```
+
+```{r missing visualization, message=FALSE}
+vis_miss(as.data.frame(t(p_d[,2:ncol(p_d)])),warn_large_data = F) #visualise missing new dataset
+```
+
+```{r remove variables with too much missing, message=FALSE}
+#calculate fraction missing
+nmissing <- function(x) sum(is.na(x)/length(x)) #create function to calculate fraction missing of vector
+m_ALS = as_vector(colwise(nmissing)(p_d[p_d$status=="ALS",])) #calculate fraction missing in patients with ALS
+m_control = as_vector(colwise(nmissing)(p_d[p_d$status=="control",])) #calculate fraction missing in controls
+
+m1 = c(m_ALS>0.33|m_control>0.33)
+k1 = c(m_ALS<0.33&m_control<0.33)
+
+#remove status column in the missing and present patterns\
+m1 = m1[-1]
+k1 = k1[-1]
+
+#split variables according to missingness
+m = p_raw_data[m1,1:6] #save variable information for excluded variables
+k = p_raw_data[k1,1:6] #save variable information for included variables
+p_d = p_d[,m_ALS<0.33&m_control<0.33] #subset dataset with variables that have less than 33% missing
+
+#visualize new dataset
+vis_miss(as.data.frame(t(p_d[,2:ncol(p_d)])),warn_large_data = F) #visualise missing new dataset
+```
+
+```{r make disease status factor correct}
+p_d$status = as.factor(p_d$status)
+p_d$status <- factor(p_d$status, levels = c("control", "ALS"))
+p_d$status = as.integer(p_d$status)-1 #make status integer with 0 and 1 (group 2 is integer 1)
+```
+
+
+```{r log transform data, message=FALSE}
+#look at data
+ #minimum and maximum values of protein expression
+p_d[1:10,1:10]
+dim(p_d)
+
+# Kernel Density Plot
+d <- density(unlist(p_d[,2:ncol(p_d)]),na.rm=T)
+log.d <- density(log(unlist(p_d[,2:ncol(p_d)])),na.rm=T)
+plot(d, main="data distribution")
+plot(log.d, main="log-transformed data distribution")
+
+#log transform data
+p_d[,2:ncol(p_d)] = log(p_d[,2:ncol(p_d)])
+
+# Kernel Density Plot
+d <- density(unlist(p_d[,2:ncol(p_d)]),na.rm=T)
+log.d <- density(log(unlist(p_d[,2:ncol(p_d)])),na.rm=T)
+plot(d, main="data distribution")
+plot(log.d, main="log-transformed data distribution")
+
+#look at data again
+min(p_d[,2:ncol(p_d)], na.rm = T);max(p_d[,2:ncol(p_d)], na.rm = T) #minimum and maximum values of protein expression
+p_d[1:10,1:10]
+dim(p_d)
+```
+
+```{r standardize data using z-score}
+p_d_unstand = p_d
+p_d_z = p_d
+#perform z-score standardization
+for(i in 2:ncol(p_d_z)){
+  p_d_z[,i] = scale(p_d_z[,i], center = TRUE, scale = TRUE)
+}
+
+p_d_z = as.data.frame(as.matrix(p_d_z)) # to remove attributes that are causing errors in the mice function
+
+```
+
+```{r standardize between 1 and 0}
+#p_d2 = apply(p_d[,2:ncol(p_d)], MARGIN = 2, FUN = function(X) (X - min(X))/diff(range(X)))
+
+for(i in 2:ncol(p_d)){
+  p_d[,i] = p_d[,i] - min(p_d[,i], na.rm = T)
+  p_d[,i] = p_d[,i] / max(p_d[,i], na.rm = T)
+}
+```
+
+
+```{r entrez ID}
+#get names right background
+
+# first load the data and then put the gene names into a vector called background
+background = k[,2]
+
+# fix formatting error from loading csv into R
+for(element in background){
+  background[background == element] = gsub("\\.","-", element)
+}
+for(i in 1:length(background)){
+  background[i] = unlist(strsplit(background[i], split=';', fixed=TRUE))[1]
+}
+
+# check names found in entrez database
+library(org.Hs.eg.db)
+hs = org.Hs.eg.db
+ids = select(hs, 
+             keys = background,
+             columns = c("ENTREZID", "SYMBOL"),
+             keytype = "SYMBOL")
+
+missing_ids = replace = ids[which(is.na(ids$ENTREZID)), "SYMBOL"] # names not found in entrez databank
+
+replace[replace == "C15orf38-AP3S2"] = "ARPIN-AP3S2"
+replace[replace == ""] = NA
+replace[replace == "hCG_2043426"] = "DDX19B"
+replace[replace == "hCG_2039566"] = "H2AB1"
+replace[replace == "SARG"] = "C1orf116"
+
+
+# replace the not found gene names
+if(length(ids[which(is.na(ids$ENTREZID)), "SYMBOL"]) == length(replace)){
+  i = 1
+  for(number in which(is.na(ids$ENTREZID))){
+    background[number] = replace[i]
+    i = i+1
+  }
+} else{
+  print("error, replace vector does not fit missing gene names")
+}
+
+# remove the gene names that are empty ( i.e. I did not figure out which proteins they are supposed to be/ their annotation suggest that they are not mappable)
+full_background = background
+background = background[!is.na(background)]
+write.csv(background, file = 'results/new_background_for_gsea.csv')
+
+# rerun to get final set of EntrezIDs
+ids = select(hs, 
+             keys = background,
+             columns = c("ENTREZID", "SYMBOL"),
+             keytype = "SYMBOL")
+
+# double check no NAs are left
+ids[which(is.na(ids$ENTREZID)), "SYMBOL"]
+
+# safe entrezIDs of background
+background_ids = ids$ENTREZID
+```
+
+```{r inspect missing before imputation}
+      #inspect missing
+      cat((sum(is.na(p_d))/prod(dim(p_d)))*100, "percentage missing") #total percentage missing
+      table(round(sort(colMeans(is.na(p_d))*100, decreasing=T),1)) #percentage missing per variable
+      
+      # delete rows with more than 70% percent missing
+      miss <- c()
+      for(i in 1:nrow(p_d)) {
+        if(length(which(is.na(p_d[i,]))) > 0.7*ncol(p_d)) miss <- append(miss,i) 
+      }
+      p_d <- p_d[-miss,]
+      p_d_z = p_d_z[-miss,]
+      p_d_unstand = p_d_unstand[-miss,]
+      vis_miss(as.data.frame(t(p_d[,2:ncol(p_d)])),warn_large_data = F) #visualise missing new dataset
+```
+
+```{r add background as colnames}
+length(full_background[is.na(full_background)])
+v = make.unique(rep("unknown",length(full_background[is.na(full_background)]))) 
+full_background[is.na(full_background)] = v
+
+full_background = make.unique(full_background)
+colnames(p_d)[2:ncol(p_d)] = colnames(p_d_z)[2:ncol(p_d_z)] = colnames(p_d_unstand)[2:ncol(p_d_unstand)] = full_background
+```
+
+```{r load old dataset}
+#load data
+old_pd <- read.csv("/Users/clara.meijs/Desktop/PhD/Proj_ALS_tear_fluid/Data/Old_proteomics_data_patient_overview.csv")
+old_expr <- read.csv("/Users/clara.meijs/Desktop/PhD/Proj_ALS_tear_fluid/Data/Old_proteomics_data_expression.csv")
+
+colnames(old_expr)[2] = "patid"
+colnames(old_pd)[1] = "patid"
+stat = old_pd[,c("patid","status")]
+
+#add disease status
+old_data <- merge(stat, old_expr, by = "patid")
+```
+
+## Boxplots before and after imputation
+
+```{r first comparison old and new dataset}
+
+      #proteins that need comparison: CRYM CAPZA2 ALDH16A1 PFKL SERPINC1 HP EIF2S2 GMPPA SCGB1D1
+      prot = c("status", "CRYM", "CAPZA2", "ALDH16A1", "PFKL", "SERPINC1", "HP", "EIF2S2", "GMPPA", "SCGB1D1")
+      
+
+### CODE TO CREATE FIGURE
+
+      d = rbind(old_data[,prot], p_d[,prot])
+      d$old_or_new = rep("new",nrow(d))
+      d$old_or_new[1:nrow(old_data)] = "old"
+      d$dataset_and_status = rep(NA,length(d$old_or_new))
+      d$status = as.character(d$status)
+      d$status[d$status == 1] = "ALS"
+      d$status[d$status == 0] = "control"
+      
+      d %>% dplyr::select(status, old_or_new, CRYM, CAPZA2, ALDH16A1, PFKL, SERPINC1, HP, EIF2S2, GMPPA, SCGB1D1) %>%
+        pivot_longer(., cols = c(CRYM, CAPZA2, ALDH16A1, PFKL, SERPINC1, HP, EIF2S2, GMPPA, SCGB1D1), names_to = "Var", values_to = "Val") %>%
+        ggplot(aes(x = Var, y = Val, fill = status)) +
+        geom_boxplot() +
+        facet_wrap(~old_or_new, scale="free") +
+        ggtitle("First boxplots before imputation") +
+        theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+      
+      ggsave("plots/boxplot_sanity_1.jpg", width = 11, height = 5, units = "in")
+      ggsave("plots/boxplot_sanity_1.pdf", width = 11, height = 5, units = "in")
+
+```
+
+```{r scatterplot of expressions old data and new data}
+
+prot_old = colnames(old_data)[4:length(colnames(old_data))]
+med_exp_prots = as.data.frame(cbind(prot_old,rep(NA,length(prot_old)),rep(NA,length(prot_old))))
+colnames(med_exp_prots) = c("proteins","med_old","med_new")
+for(i in 1:nrow(med_exp_prots)){
+  if(length(p_d[p_d$status==1,med_exp_prots$proteins[i]])>0){
+    med_exp_prots$med_old[i] = median(old_data[old_data$status==1,med_exp_prots$proteins[i]])
+    med_exp_prots$med_new[i] = median(p_d[p_d$status==1,med_exp_prots$proteins[i]])
+  }
+}
+
+plot(x = med_exp_prots$med_old, y = med_exp_prots$med_new, main = "ALS protein expression")
+
+prot_old = colnames(old_data)[4:length(colnames(old_data))]
+med_exp_prots = as.data.frame(cbind(prot_old,rep(NA,length(prot_old)),rep(NA,length(prot_old))))
+colnames(med_exp_prots) = c("proteins","med_old","med_new")
+for(i in 1:nrow(med_exp_prots)){
+  if(length(p_d[p_d$status==1,med_exp_prots$proteins[i]])>0){
+    med_exp_prots$med_old[i] = median(old_data[old_data$status==0,med_exp_prots$proteins[i]])
+    med_exp_prots$med_new[i] = median(p_d[p_d$status==0,med_exp_prots$proteins[i]])
+  }
+}
+
+plot(x = med_exp_prots$med_old, y = med_exp_prots$med_new, main = "control protein expression")
+
+```
+
+```{r comparison zoomed in on EIF2S2}
+
+      d %>% dplyr::select(old_or_new, status, EIF2S2) %>%
+        pivot_longer(., cols = EIF2S2, names_to = "Var", values_to = "Val") %>%
+        ggplot(aes(x = Var, y = Val, fill = status)) +
+        geom_boxplot() +
+        facet_wrap(~old_or_new, scale="free") +
+        ggtitle("First boxplots before imputation") +
+        theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+      
+      ggsave("plots/boxplot_sanity_EIF2S2.jpg", width = 11, height = 5, units = "in")
+      ggsave("plots/boxplot_sanity_EIF2S2.pdf", width = 11, height = 5, units = "in")
+
+```
+
+
+```{r first comparison old and new dataset with z-score standardization}
+
+# z-score standardization of old data
+            
+      old_data_z = old_data
+      #perform z-score standardization
+      for(i in 4:ncol(old_data_z)){
+        old_data_z[,i] = scale(old_data_z[,i], center = TRUE, scale = TRUE)
+      }
+      old_data_z = as.data.frame(as.matrix(old_data_z)) # to remove attributes that are causing errors in the mice function
+
+#proteins that need comparison: CRYM CAPZA2 ALDH16A1 PFKL SERPINC1 HP EIF2S2 GMPPA SCGB1D1
+      
+      prot = c("status", "CRYM", "CAPZA2", "ALDH16A1", "PFKL", "SERPINC1", "HP", "EIF2S2", "GMPPA", "SCGB1D1")
+      
+
+### CODE TO CREATE FIGURE
+
+      d = rbind(old_data_z[,prot], p_d_z[,prot])
+      for(i in 1:ncol(d)){ d[,i] = as.numeric(d[,i])}
+      d$old_or_new = rep("new",nrow(d))
+      d$old_or_new[1:nrow(old_data)] = "old"
+      d$dataset_and_status = rep(NA,length(d$old_or_new))
+      d$status = as.character(d$status)
+      d$status[d$status == 1] = "ALS"
+      d$status[d$status == 0] = "control"
+      
+      d %>% dplyr::select(status, old_or_new, CRYM, CAPZA2, ALDH16A1, PFKL, SERPINC1, HP, EIF2S2, GMPPA, SCGB1D1) %>%
+        pivot_longer(., cols = c(CRYM, CAPZA2, ALDH16A1, PFKL, SERPINC1, HP, EIF2S2, GMPPA, SCGB1D1), names_to = "Var", values_to = "Val") %>%
+        ggplot(aes(x = Var, y = Val, fill = status)) +
+        geom_boxplot() +
+        facet_wrap(~old_or_new, scale="free") +
+        ggtitle("First boxplots before imputation, new data z-score standardized") +
+        theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+      
+      ggsave("plots/boxplot_sanity_z.jpg", width = 11, height = 5, units = "in")
+      ggsave("plots/boxplot_sanity_z.pdf", width = 11, height = 5, units = "in")
+
+```
+
+```{r KNN imputation}
+
+imp = impute.knn(t(p_d) ,k = 10, rowmax = 0.6, colmax = 0.70, maxp = 1500, rng.seed=362436069)
+imp_z = impute.knn(t(p_d_z) ,k = 10, rowmax = 0.6, colmax = 0.70, maxp = 1500, rng.seed=362436069)
+
+df_ml = as.data.frame(t(imp$data))
+p_d_z_imp = as.data.frame(t(imp_z$data))
+
+cat((sum(is.na(df_ml))/prod(dim(df_ml)))*100, "percentage missing") #total percentage missing
+
+```
+
+```{r KNN imputation comparison old and new dataset}
+### CODE TO CREATE FIGURE
+
+      d = rbind(old_data[,prot], df_ml[,prot])
+      d$old_or_new = rep("new",nrow(d))
+      d$old_or_new[1:nrow(old_data)] = "old"
+      d$dataset_and_status = rep(NA,length(d$old_or_new))
+      d$status = as.character(d$status)
+      d$status[d$status == 1] = "ALS"
+      d$status[d$status == 0] = "control"
+      
+      d %>% dplyr::select(status, old_or_new, CRYM, CAPZA2, ALDH16A1, PFKL, SERPINC1, HP, EIF2S2, GMPPA, SCGB1D1) %>%
+        pivot_longer(., cols = c(CRYM, CAPZA2, ALDH16A1, PFKL, SERPINC1, HP, EIF2S2, GMPPA, SCGB1D1), names_to = "Var", values_to = "Val") %>%
+        ggplot(aes(x = Var, y = Val, fill = status)) +
+        geom_boxplot() +
+        facet_wrap(~old_or_new, scale="free") +
+        ggtitle("First boxplots after KNN imputation") +
+        theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+      
+      ggsave("plots/boxplot_sanity_knn.jpg", width = 11, height = 5, units = "in")
+      ggsave("plots/boxplot_sanity_knn.pdf", width = 11, height = 5, units = "in")
+
+```
+
+```{r minprob imputation}
+
+write.csv(p_d,"results/data_for_minprob_imputation.csv", row.names=TRUE, quote=FALSE)
+
+#ANNA PERFORMED MINPROB IMPUTATION
+
+p_d_minprob = read.csv("data/data_imputed_MinProb.csv")
+
+d.imp <- density(unlist(p_d_minprob[,2:ncol(p_d_minprob)]),na.rm=T)
+d <- density(unlist(p_d[,2:ncol(p_d)]),na.rm=T)
+plot(d, main="not imputed data distribution")
+plot(d.imp, main="min_prob imputed data distribution")
+
+```
+
+
+```{r minprob imputation comparison old and new dataset}
+### CODE TO CREATE FIGURE
+      
+      p_d_minprob2 = cbind(p_d$status,p_d_minprob)
+      colnames(p_d_minprob2)[1] = "status"
+      d = rbind(old_data[,prot], p_d_minprob2[,prot])
+      d$old_or_new = rep("new",nrow(d))
+      d$old_or_new[1:nrow(old_data)] = "old"
+      d$status = as.character(d$status)
+      d$status[d$status == 1] = "ALS"
+      d$status[d$status == 0] = "control"
+      
+      d %>% dplyr::select(status, old_or_new, CRYM, CAPZA2, ALDH16A1, PFKL, SERPINC1, HP, EIF2S2, GMPPA, SCGB1D1) %>%
+        pivot_longer(., cols = c(CRYM, CAPZA2, ALDH16A1, PFKL, SERPINC1, HP, EIF2S2, GMPPA, SCGB1D1), names_to = "Var", values_to = "Val") %>%
+        ggplot(aes(x = Var, y = Val, fill = status)) +
+        geom_boxplot() +
+        facet_wrap(~old_or_new, scale="free") +
+        ggtitle("First boxplots after min_prob imputation") +
+        theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+      
+      ggsave("plots/boxplot_sanity_minprob.jpg", width = 11, height = 5, units = "in")
+      ggsave("plots/boxplot_sanity_minprob.pdf", width = 11, height = 5, units = "in")
+
+```
+
+```{r manual imputation}
+
+#ANNA PERFORMED MINPROB IMPUTATION
+
+p_d_manual = read.csv("data/data_imputed_manual.csv")
+
+d.imp <- density(unlist(p_d_manual[,2:ncol(p_d_manual)]),na.rm=T)
+d <- density(unlist(p_d[,2:ncol(p_d)]),na.rm=T)
+plot(d, main="not imputed data distribution")
+plot(d.imp, main="manual imputed data distribution")
+
+```
+
+```{r manual imputation comparison old and new dataset}
+### CODE TO CREATE FIGURE
+      
+      p_d_manual2 = cbind(p_d$status,p_d_manual)
+      colnames(p_d_manual2)[1] = "status"
+      d = rbind(old_data[,prot], p_d_manual2[,prot])
+      d$old_or_new = rep("new",nrow(d))
+      d$old_or_new[1:nrow(old_data)] = "old"
+      d$status = as.character(d$status)
+      d$status[d$status == 1] = "ALS"
+      d$status[d$status == 0] = "control"
+      
+      d %>% dplyr::select(status, old_or_new, CRYM, CAPZA2, ALDH16A1, PFKL, SERPINC1, HP, EIF2S2, GMPPA, SCGB1D1) %>%
+        pivot_longer(., cols = c(CRYM, CAPZA2, ALDH16A1, PFKL, SERPINC1, HP, EIF2S2, GMPPA, SCGB1D1), names_to = "Var", values_to = "Val") %>%
+        ggplot(aes(x = Var, y = Val, fill = status)) +
+        geom_boxplot() +
+        facet_wrap(~old_or_new, scale="free") +
+        ggtitle("First boxplots after manual imputation") +
+        theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+      
+      ggsave("plots/boxplot_sanity_manual_imp.jpg", width = 11, height = 5, units = "in")
+      ggsave("plots/boxplot_sanity_manual_imp.pdf", width = 11, height = 5, units = "in")
+
+```
+
+```{r save all datasets for DE analysis}
+write.csv(as.data.frame(t(p_d_unstand)),"results/DE_data_not_imputed_unstandardized.csv", row.names=TRUE, quote=FALSE)
+write.csv(as.data.frame(t(p_d)),"results/DE_data_not_imputed_0to1.csv", row.names=TRUE, quote=FALSE)
+write.csv(as.data.frame(t(p_d_z)),"results/DE_data_not_imputed_zscore.csv", row.names=TRUE, quote=FALSE)
+write.csv(as.data.frame(t(df_ml)),"results/DE_data_KNN_imputed_0to1.csv", row.names=TRUE, quote=FALSE)
+write.csv(as.data.frame(t(p_d_minprob)),"results/DE_data_minprob_imputed_0to1.csv", row.names=TRUE, quote=FALSE)
+write.csv(as.data.frame(t(p_d_z_imp)),"results/DE_data_KNN_imputed_zscore.csv", row.names=TRUE, quote=FALSE)
+
+# subset with disease onset
+clin_onset = as.data.frame(cbind(clin$patid, clin$onset))
+clin_onset = clin_onset[-31,]
+colnames(clin_onset) = c("patid","onset")
+p_d_z_imp$patid = rownames(p_d_z_imp)
+p_d_onset <- merge(clin_onset, p_d_z_imp, by = "patid")
+p_d_onset = p_d_onset[p_d_onset$status==1,]
+p_d_onset_1 = p_d_onset[p_d_onset$onset==1,]
+p_d_onset_2 = p_d_onset[p_d_onset$onset==2,]
+p_d_onset_3 = p_d_onset[p_d_onset$onset==3,]
+
+write.csv(as.data.frame(t(p_d_onset_1)),"results/DE_data_onset_1.csv", row.names=TRUE, quote=FALSE)
+write.csv(as.data.frame(t(p_d_onset_2)),"results/DE_data_onset_2.csv", row.names=TRUE, quote=FALSE)
+write.csv(as.data.frame(t(p_d_onset_3)),"results/DE_data_onset_3.csv", row.names=TRUE, quote=FALSE)
+
+# subset man and woman
+clin_sex = as.data.frame(cbind(clin$patid, clin$sex))
+clin_sex = clin_sex[-31,]
+colnames(clin_sex) = c("patid","sex")
+p_d_sex <- merge(clin_sex, p_d_z_imp, by = "patid")
+
+p_d_female = p_d_sex[p_d_sex$sex==0,]
+p_d_male = p_d_sex[p_d_sex$sex==1,]
+
+write.csv(as.data.frame(t(p_d_female)),"results/DE_data_female.csv", row.names=TRUE, quote=FALSE)
+write.csv(as.data.frame(t(p_d_male)),"results/DE_data_male.csv", row.names=TRUE, quote=FALSE)
+```
+
+
+## Venn Diagrams 
+
+```{r summary all proteins found comparison}
+if (!require(devtools)) install.packages("devtools")
+devtools::install_github("yanlinlin82/ggvenn")
+library(ggvenn)
+
+old_proteins = colnames(old_expr)[3:ncol(old_expr)]
+
+for(i in 1:length(old_proteins)){
+  old_proteins[i] = unlist(strsplit(old_proteins[i], split='.', fixed=TRUE))[1]
+}
+
+names = list(all_proteins_NEW_dataset = background, all_proteins_OLD_dataset = old_proteins)
+
+ggvenn(
+  names, 
+  fill_color = c("#0073C2FF", "#EFC000FF"),
+  stroke_size = 0.5, set_name_size = 4, text_size = 7
+  )
+      ggsave("plots/venn_sanity.jpg", width = 11, height = 8, units = "in")
+      ggsave("plots/venn_sanity.pdf", width = 11, height = 8, units = "in")
+
+m = old_proteins[!old_proteins %in% background]
+m = unique(m)
+write.csv(m,"results/venn_diagram_only_in_old_dataset.csv", row.names=TRUE, quote=FALSE)
+```
+
+
+```{r compare mean expression in new and old dataset}
+#compare mean expression values of proteins that are in both datasets, and that are only in the new one
+m_both = background[background %in% old_proteins]
+m_new = background[!background %in% old_proteins]
+
+#boxplot all measurements piled together
+boxplot(
+  unlist(p_d_unstand[,m_both]),
+  unlist(p_d_unstand[,m_new]), 
+  names = c("proteins in both datasets","proteins only in new dataset"),
+  main = "Boxplot unstandardized expression values, all values piled together")
+summary(unlist(p_d_unstand[,m_both]))
+summary(unlist(p_d_unstand[,m_new]))
+
+#boxplot showing colmeans
+boxplot(
+  unlist(colMeans(p_d_unstand[,m_both])),
+  unlist(colMeans(p_d_unstand[,m_new])), 
+  names = c("proteins in both datasets","proteins only in new dataset"),
+  main = "Boxplot unstandardized expression values, protein means")
+summary(unlist(colMeans(p_d_unstand[,m_both])))
+summary(unlist(colMeans(p_d_unstand[,m_new])))
+
+#boxplot showing col medians
+boxplot(
+  unlist(apply(p_d_unstand[,m_both],2,median)),
+  unlist(apply(p_d_unstand[,m_new],2,median)), 
+  names = c("proteins in both datasets","proteins only in new dataset"),
+  main = "Boxplot unstandardized expression values, protein medians")
+summary(unlist(apply(p_d_unstand[,m_both],2,median)))
+summary(unlist(apply(p_d_unstand[,m_new],2,median)))
+
+#density plot showing piled expression values
+x = unlist(as.data.frame(t(p_d_unstand)))
+y = as.factor(rep(colnames(p_d_unstand) %in% old_proteins,nrow(p_d_unstand)))
+levels(y) <- c("proteins only in new dataset","proteins in both datasets")
+dens = data.frame(x, y)
+ggplot(dens, aes(x = x, colour = y), na.rm = T) +
+  geom_density() +
+  labs(x = "Expression values")+
+  scale_color_manual(values=c("#999999", "#E69F00"))
+ggsave("plots/density_unstand_old_and_new_dataset_all_values.jpg", width = 11, height = 8, units = "in")
+ggsave("plots/density_unstand_old_and_new_dataset_all_values.pdf", width = 11, height = 8, units = "in")
+
+#density plot showing mean expression values
+x = unlist(colMeans(p_d_unstand))
+y = as.factor(colnames(p_d_unstand) %in% old_proteins)
+levels(y) <- c("proteins only in new dataset","proteins in both datasets")
+dens = data.frame(x, y)
+ggplot(dens, aes(x = x, colour = y), na.rm = T) +
+  geom_density() +
+  labs(x = "Expression values")+
+  scale_color_manual(values=c("#999999", "#E69F00"))
+ggsave("plots/density_unstand_old_and_new_dataset_mean_values.jpg", width = 11, height = 8, units = "in")
+ggsave("plots/density_unstand_old_and_new_dataset_mean_values.pdf", width = 11, height = 8, units = "in")
+
+#density plot showing mean expression values
+x = unlist(apply(p_d_unstand,2,median))
+dens = data.frame(x, y)
+ggplot(dens, aes(x = x, colour = y), na.rm = T) +
+  geom_density() +
+  labs(x = "Expression values")+
+  scale_color_manual(values=c("#999999", "#E69F00"))
+ggsave("plots/density_unstand_old_and_new_dataset_median_values.jpg", width = 11, height = 8, units = "in")
+ggsave("plots/density_unstand_old_and_new_dataset_median_values.pdf", width = 11, height = 8, units = "in")
+
+
+```
+
+```{r compare mean expression in new and old dataset after KNN imputation}
+
+imp = impute.knn(t(p_d_unstand) ,k = 10, rowmax = 0.6, colmax = 0.70, maxp = 1500, rng.seed=362436069)
+p_d_unstand_imp = as.data.frame(t(imp$data))
+write.csv(p_d_unstand_imp,"results/DE_data_knn_imputed_unstandardized.csv", row.names=TRUE, quote=FALSE)
+
+#boxplot all measurements piled together
+boxplot(
+  unlist(p_d_unstand_imp[,m_both]),
+  unlist(p_d_unstand_imp[,m_new]), 
+  names = c("proteins in both datasets","proteins only in new dataset"),
+  main = "Boxplot unstand. and imp. expression values, all values piled together")
+summary(unlist(p_d_unstand_imp[,m_both]))
+summary(unlist(p_d_unstand_imp[,m_new]))
+
+#boxplot showing colmeans
+boxplot(
+  unlist(colMeans(p_d_unstand_imp[,m_both])),
+  unlist(colMeans(p_d_unstand_imp[,m_new])), 
+  names = c("proteins in both datasets","proteins only in new dataset"),
+  main = "Boxplot unstand. and imp. expression values, protein means")
+summary(unlist(colMeans(p_d_unstand_imp[,m_both])))
+summary(unlist(colMeans(p_d_unstand_imp[,m_new])))
+
+#boxplot showing col medians
+boxplot(
+  unlist(apply(p_d_unstand_imp[,m_both],2,median)),
+  unlist(apply(p_d_unstand_imp[,m_new],2,median)), 
+  names = c("proteins in both datasets","proteins only in new dataset"),
+  main = "Boxplot unstand. and imp. expression values, protein medians")
+summary(unlist(apply(p_d_unstand_imp[,m_both],2,median)))
+summary(unlist(apply(p_d_unstand_imp[,m_new],2,median)))
+
+#density plot showing piled expression values
+x = unlist(as.data.frame(t(p_d_unstand_imp)))
+y = as.factor(rep(colnames(p_d_unstand_imp) %in% old_proteins,nrow(p_d_unstand_imp)))
+levels(y) <- c("proteins only in new dataset","proteins in both datasets")
+dens = data.frame(x, y)
+ggplot(dens, aes(x = x, colour = y), na.rm = T) +
+  geom_density() +
+  labs(x = "Expression values")+
+  scale_color_manual(values=c("#999999", "#E69F00"))
+ggsave("plots/density_imp_unstand_old_and_new_dataset_all_values.jpg", width = 11, height = 8, units = "in")
+ggsave("plots/density_imp_unstand_old_and_new_dataset_all_values.pdf", width = 11, height = 8, units = "in")
+
+#density plot showing mean expression values
+x = unlist(colMeans(p_d_unstand_imp))
+y = as.factor(colnames(p_d_unstand_imp) %in% old_proteins)
+levels(y) <- c("proteins only in new dataset","proteins in both datasets")
+dens = data.frame(x, y)
+ggplot(dens, aes(x = x, colour = y), na.rm = T) +
+  geom_density() +
+  labs(x = "Expression values")+
+  scale_color_manual(values=c("#999999", "#E69F00"))
+ggsave("plots/density_imp_unstand_old_and_new_dataset_mean_values.jpg", width = 11, height = 8, units = "in")
+ggsave("plots/density_imp_unstand_old_and_new_dataset_mean_values.pdf", width = 11, height = 8, units = "in")
+
+#density plot showing mean expression values
+x = unlist(apply(p_d_unstand_imp,2,median))
+dens = data.frame(x, y)
+ggplot(dens, aes(x = x, colour = y), na.rm = T) +
+  geom_density() +
+  labs(x = "Expression values") +
+  scale_color_manual(values=c("#999999", "#E69F00"))
+ggsave("plots/density_imp_unstand_old_and_new_dataset_median_values.jpg", width = 11, height = 8, units = "in")
+ggsave("plots/density_imp_unstand_old_and_new_dataset_median_values.pdf", width = 11, height = 8, units = "in")
+```
+
+
+
+```{r load old DE analysis}
+#load outcomes DE analysis old dataset
+      library(readxl)
+      old_DE <- read_excel("data/old_DE_results.xlsx", skip = 1)
+      old_DE = old_DE[,2:4]
+      
+      colnames(old_DE) = c("minus_logFDR","log_fold_change","gene_name")
+      
+      #give ranking for FDR + on which level significant
+      old_DE = old_DE[order(abs(old_DE$minus_logFDR), decreasing = TRUE), ]
+      old_DE$ranking_FDR = 1:nrow(old_DE)
+      
+       #give ranking for log2FC
+      old_DE = old_DE[order(abs(old_DE$log_fold_change), decreasing = TRUE), ]
+      old_DE$ranking_change = 1:nrow(old_DE)
+      
+      # notate level of significance
+      old_DE$significant = rep("no",nrow(old_DE))
+      old_DE$significant[old_DE$minus_logFDR > -log(0.1)] = "sign on FDR 10%"
+      old_DE$significant[old_DE$minus_logFDR > -log(0.05)] = "sign on FDR 5%"
+      
+      vars_in_old_DE = old_DE[old_DE$gene_name %in% prot[2:10],]
+      write.csv(vars_in_old_DE,"results/validated_vars_in_old_DE.csv", row.names=TRUE, quote=FALSE)
+      
+```
+
+
+```{r load new DE analysis}
+
+#load outcomes DE analysis done with DEP
+      
+      DE_knn = read.csv("results/data_DEP_results_knn.csv")
+      DE_manual = read.csv("results/data_DEP_results_manual.csv")
+      DE_MinProb = read.csv("results/data_DEP_results_MinProb.csv")
+      
+    #perform permutation-based FDR correction
+      # Load the qvalue package
+      #BiocManager::install("qvalue")
+      library(qvalue)
+      
+     # Compute the q-values
+      DE_knn$qvalues = qvalue(p = DE_knn$ALS_vs_CTR_p.val)$qvalues
+      DE_manual$qvalues = qvalue(p = DE_manual$ALS_vs_CTR_p.val)$qvalues
+      DE_MinProb$qvalues = qvalue(p = DE_MinProb$ALS_vs_CTR_p.val)$qvalues
+  
+    #give ranking for FDR 
+      DE_knn = DE_knn[order(abs(DE_knn$qvalues), decreasing = FALSE), ]
+      DE_manual = DE_manual[order(abs(DE_manual$qvalues), decreasing = FALSE), ]
+      DE_MinProb = DE_MinProb[order(abs(DE_MinProb$qvalues), decreasing = FALSE), ]
+      
+      DE_knn$ranking_FDR = 1:nrow(DE_knn)
+      DE_manual$ranking_FDR = 1:nrow(DE_manual)
+      DE_MinProb$ranking_FDR = 1:nrow(DE_MinProb)
+      
+    #give ranking for log2FC
+      DE_knn = DE_knn[order(abs(DE_knn$ALS_vs_CTR_log2FC), decreasing = TRUE), ]
+      DE_manual = DE_manual[order(abs(DE_manual$ALS_vs_CTR_log2FC), decreasing = TRUE), ]
+      DE_MinProb = DE_MinProb[order(abs(DE_MinProb$ALS_vs_CTR_log2FC), decreasing = TRUE), ]
+      
+      DE_knn$ranking_change = 1:nrow(DE_knn)
+      DE_manual$ranking_change = 1:nrow(DE_manual)
+      DE_MinProb$ranking_change = 1:nrow(DE_MinProb)
+    
+    # notate level of significance
+      DE_knn$significant = rep("no",nrow(DE_knn))
+      DE_manual$significant = rep("no",nrow(DE_manual))
+      DE_MinProb$significant = rep("no",nrow(DE_MinProb))
+      
+      DE_knn$significant[DE_knn$qvalues < 0.1] = "sign on FDR 10%"
+      DE_manual$significant[DE_manual$qvalues < 0.1] = "sign on FDR 10%"
+      DE_MinProb$significant[DE_MinProb$qvalues < 0.1] = "sign on FDR 10%"
+      
+      DE_knn$significant[DE_knn$qvalues < 0.05] = "sign on FDR 5%"
+      DE_manual$significant[DE_manual$qvalues < 0.05] = "sign on FDR 5%"
+      DE_MinProb$significant[DE_MinProb$qvalues < 0.05] = "sign on FDR 5%"
+      
+      vars_in_DE_knn = DE_knn[DE_knn$name %in% prot[2:10],]
+      write.csv(vars_in_DE_knn,"results/validated_vars_in_new_DE_knn.csv", row.names=TRUE, quote=FALSE)
+      
+      vars_in_DE_manual = DE_manual[DE_manual$name %in% prot[2:10],]
+      write.csv(vars_in_DE_manual,"results/validated_vars_in_new_DE_manual.csv", row.names=TRUE, quote=FALSE)
+      
+      vars_in_DE_MinProb = DE_MinProb[DE_MinProb$name %in% prot[2:10],]
+      write.csv(vars_in_DE_MinProb,"results/validated_vars_in_new_DE_MinProb.csv", row.names=TRUE, quote=FALSE)
+
+```
+
+```{r DE analysis using limma package CCA}
+      
+      library(limma)
+      library(IceR)
+      
+      d = read.csv("results/data_for_minprob_imputation.csv")
+      d = as.data.frame(t(d))
+      status = as.factor(as.character(d[2,]))
+      levels(status) = c("control","ALS")
+      d = d[3:nrow(d),1:ncol(d)]
+      
+      DE_limma = LIMMA_analysis(
+          data = d,
+          assignments = status)
+      
+      head(DE_limma)
+      DE_limma[prot[2:10],]
+
+    #give ranking for FDR 
+      DE_limma = DE_limma[order(abs(DE_limma$adj.P.Val), decreasing = FALSE), ]
+      DE_limma$ranking_FDR = 1:nrow(DE_limma)
+    
+    #give ranking for log2FC
+      DE_limma = DE_limma[order(abs(DE_limma$logFC), decreasing = TRUE), ]
+      DE_limma$ranking_change = 1:nrow(DE_limma)
+      
+      
+      vars_in_DE_limma = DE_limma[rownames(DE_limma) %in% prot[2:10],]
+      write.csv(vars_in_DE_knn,"results/validated_vars_in_new_DE_limma_CCA.csv", row.names=TRUE, quote=FALSE)
+      
+      dim(DE_limma[DE_limma$adj.P.Val<0.1,]) #zero proteins significant
+ 
+```
+
+```{r DE analysis using limma package knn}
+      
+      library(limma)
+      
+      d = read.csv("results/DE_data_KNN_imputed_zscore.csv")
+      rownames(d) = d$X
+      d = d[2:nrow(d),2:ncol(d)]
+      
+      DE_limma = LIMMA_analysis(
+          data = d,
+          assignments = status)
+      
+      head(DE_limma)
+      DE_limma[DE_limma$adj.P.Val<0.1,] #one proteins significant
+      DE_limma[prot[2:10],]
+
+    #give ranking for FDR 
+      DE_limma = DE_limma[order(abs(DE_limma$adj.P.Val), decreasing = FALSE), ]
+      DE_limma$ranking_FDR = 1:nrow(DE_limma)
+      write.csv(DE_limma,"results/DE_limma_knn.csv", row.names=TRUE, quote=FALSE)
+    
+    #give ranking for log2FC
+      DE_limma = DE_limma[order(abs(DE_limma$logFC), decreasing = TRUE), ]
+      DE_limma$ranking_change = 1:nrow(DE_limma)
+      
+      vars_in_DE_limma = DE_limma[rownames(DE_limma) %in% prot[2:10],]
+      write.csv(vars_in_DE_knn,"results/validated_vars_in_new_DE_limma_knn.csv", row.names=TRUE, quote=FALSE)
+ 
+```
+
+
